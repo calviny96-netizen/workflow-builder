@@ -1,0 +1,31 @@
+{
+  "name": "autoaudit-workflow-builder",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "contract": "node --env-file=.env scripts/contract-check.ts",
+    "contract:run": "node --env-file=.env scripts/contract-check.ts --run",
+    "contract:merge": "node --env-file=.env scripts/contract-check.ts --merge",
+    "test": "node --test",
+    "db": "node scripts/db.ts",
+    "test:engine": "node --env-file=.env --test scripts/e2e-engine.ts",
+    "server": "node --env-file=.env apps/server/src/main.ts",
+    "web": "npm run dev -w @aawb/web",
+    "build": "npm run build -w @aawb/web"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "embedded-postgres": "^18.4.0-beta.17",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
+}
