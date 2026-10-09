@@ -4,7 +4,7 @@
 import { errorCode, unwrap } from '../../../packages/autoaudit/src/index.ts';
 import type { AuditFilter, AutoAuditClient, RunPayload } from '../../../packages/autoaudit/src/index.ts';
 import { daysBetween, fingerprint, recommendChunk, splitByContacts, splitByDays } from '../../../packages/engine/src/plan.ts';
-import { incoming, parsePhones, salesBehind, validateGraph, resolvePeriod, wibClock } from '../../../packages/nodes/src/index.ts';
+import { incoming, normalizeChatId, parseChatIds, salesBehind, validateGraph, resolvePeriod, wibClock } from '../../../packages/nodes/src/index.ts';
 import type { Graph, GraphNode } from '../../../packages/nodes/src/index.ts';
 
 export interface RunParams {
@@ -41,7 +41,7 @@ export interface PlanGroup {
     full: Estimate;
   };
   period?: { start_date: string; end_date: string; days: number };
-  contacts?: { mode: 'only' | 'exclude'; count: number }; // filter nomor yang berlaku
+  contacts?: { mode: 'only' | 'exclude'; count: number }; // filter nomor atau ID grup yang berlaku
   full?: Estimate; // estimasi periode penuh untuk sumber tanpa Chunk (hanya di tahap pratinjau)
   units: number;
   warnings: string[];
@@ -240,12 +240,12 @@ export async function buildPlan(input: {
       chat_numbers: [],
       timezone: TIMEZONE,
     };
-    // Filter kontak: "hanya nomor ini" = chat_numbers; "kecualikan" = chat_numbers + is_excluded (terverifikasi di preflight).
+    // Nomor private dinormalisasi; ID grup tetap berupa string, termasuk ID lebih dari 15 digit.
     const contactMode: 'all' | 'only' | 'exclude' = c.contactMode === 'only' || c.contactMode === 'exclude' ? c.contactMode : 'all';
-    const phones = contactMode === 'all' ? [] : parsePhones(c.contactNumbers).numbers;
-    const phoneSet = new Set(phones);
+    const chatIds = contactMode === 'all' ? [] : parseChatIds(c.contactNumbers, baseFilter.chat_type).numbers;
+    const selectedIds = new Set(chatIds);
     if (contactMode !== 'all') {
-      baseFilter.chat_numbers = phones;
+      baseFilter.chat_numbers = chatIds;
       baseFilter.is_excluded = contactMode === 'exclude';
     }
 
@@ -281,7 +281,7 @@ export async function buildPlan(input: {
       if (inp.source.channel === 'whatsapp_official' && (baseFilter.chat_type !== 'individual' || baseFilter.include_full_history_mode !== 'none')) {
         throw new PlanError([`${inp.source.name}: WhatsApp Official mendukung chat private dengan history pada rentang tanggal terpilih. Pilih "Hanya chat private" dan "Hanya rentang tanggal terpilih" pada Proses AW.`]);
       }
-      const group: PlanGroup = { nodeId: aw.id, period: { ...period, days: periodDays }, source: inp.source, chunk: null, units: 0, warnings: [], contacts: contactMode === 'all' ? undefined : { mode: contactMode, count: phones.length } };
+      const group: PlanGroup = { nodeId: aw.id, period: { ...period, days: periodDays }, source: inp.source, chunk: null, units: 0, warnings: [], contacts: contactMode === 'all' ? undefined : { mode: contactMode, count: chatIds.length } };
       plan.groups.push(group);
 
       if (!inp.chunkNode) {
@@ -298,7 +298,7 @@ export async function buildPlan(input: {
       const manual = cc.size !== null && cc.size !== undefined && Number(cc.size) >= 1;
       const size = manual ? Math.floor(Number(cc.size)) : mode === 'days' ? recommended.daysPerPart : recommended.contactsPerPart;
       group.chunk = { nodeId: inp.chunkNode.id, mode, size, sizeFrom: manual ? 'manual' : 'usulan', recommended, full };
-      if (contactMode === 'only' && full.contacts < phones.length) group.warnings.push(`${inp.source.name}: ${phones.length - full.contacts} dari ${phones.length} nomor tidak punya chat pada periode ini.`);
+      if (contactMode === 'only' && full.contacts < chatIds.length) group.warnings.push(`${inp.source.name}: ${chatIds.length - full.contacts} dari ${chatIds.length} nomor atau ID grup tidak punya chat pada periode ini.`);
       if (input.previewOnly) continue; // tahap pratinjau berhenti di estimasi periode penuh
 
       if (full.contacts === 0) {
@@ -315,12 +315,12 @@ export async function buildPlan(input: {
           drafts.push({ group, label: `${inp.source.name} · ${label}`, filter: { ...baseFilter, start_date: s.start_date, end_date: s.end_date } });
         }
       } else {
-        // Daftar kontak disaring dulu sesuai filter nomor, baru dibagi. Tiap bagian lalu membawa nomornya sendiri.
+        // Cocokkan kedua bentuk ID sebelum chunk, termasuk kontak yang hanya memiliki chat_key.
         const everyone = inp.source.channel === 'whatsapp_official'
           ? await allOfficialContacts(api, companyId, inp.source.id, baseFilter)
           : await allContacts(api, inp.source.id, baseFilter);
         const contacts =
-          contactMode === 'all' ? everyone : everyone.filter((x: any) => phoneSet.has(String(x.phone_number)) === (contactMode === 'only'));
+          contactMode === 'all' ? everyone : everyone.filter((x: any) => selectedIds.has(normalizeChatId(x.phone_number || x.chat_key)) === (contactMode === 'only'));
         const { slices, warnings } = splitByContacts(contacts, size, maxParts);
         group.warnings.push(...warnings);
         for (const s of slices) {

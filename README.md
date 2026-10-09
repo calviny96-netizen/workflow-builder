@@ -169,6 +169,21 @@ tabel users masih kosong.
 
 ## Pengaturan tambahan (opsional)
 
+### Filter nomor dan grup pada Proses AW
+
+Untuk Sales ID (WhatsApp OTP), pilih **Jenis chat → Hanya grup** atau
+**Private + grup**, lalu **Kontak / grup yang dianalisis → Hanya pilihan ini**.
+Tempel ID grup yang disalin dari AutoAudit, satu per baris. Bentuk angka panjang
+dan `…@g.us` diterima; keduanya dicocokkan sebagai ID yang sama. ID tetap berupa
+teks sehingga digitnya tidak berubah. ID grup lama berbentuk `nomor-timestamp`
+juga dipertahankan. Nomor private tetap menerima format `08…`, `+62…`, atau `62…`.
+
+**Kecualikan pilihan ini** melewati chat yang dipilih. Filter yang sama dipakai
+pada pratinjau, preflight, dan payload run, termasuk saat chunk per tanggal
+atau per kontak. Input tidak valid atau ID grup dengan jenis chat private
+menampilkan pesan validasi sebelum analisis. Sumber WhatsApp Official tetap
+mendukung chat private sesuai kontrak API.
+
 ### Sumber WhatsApp Official
 
 Pada node **Sales**, pilih **Jenis sumber → WhatsApp Official**, lalu centang

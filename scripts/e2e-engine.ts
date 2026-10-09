@@ -19,6 +19,7 @@ import { buildApp } from '../apps/server/src/app.ts';
 import { hashPassword } from '../apps/server/src/auth.ts';
 import { createPool, migrate } from '../apps/server/src/db.ts';
 import { createExecutor } from '../apps/server/src/executor.ts';
+import { normalizeChatId } from '../packages/nodes/src/chat-ids.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -50,12 +51,18 @@ const mock = {
   contacts: { 1: 90, 2: 25, 3: 0 } as Record<number, number>, // jumlah kontak per sales
 };
 
-function contactsOf(salesId: number) {
-  return Array.from({ length: mock.contacts[salesId] ?? 10 }, (_, i) => ({
+function contactsOf(salesId: number, chatType?: string) {
+  const contacts = salesId === 4 ? [
+    { chat_key: '120363123456789012', phone_number: '120363123456789012', message_count: 100, chat_type: 'group' },
+    { chat_key: '6281234567890-1630000000@g.us', phone_number: '', message_count: 50, chat_type: 'group' },
+    { chat_key: '6281234567890@c.us', phone_number: '6281234567890', message_count: 10, chat_type: 'individual' },
+  ] : Array.from({ length: mock.contacts[salesId] ?? 10 }, (_, i) => ({
     chat_key: `${salesId}${i}@c.us`,
     phone_number: `628${salesId}${String(i).padStart(9, '0')}`, // 13 digit, seperti nomor sungguhan
     message_count: 100 - i,
+    chat_type: 'individual',
   }));
+  return contacts.filter(c => !chatType || chatType === 'both' || c.chat_type === chatType);
 }
 
 function settle() {
@@ -138,7 +145,7 @@ const aa = createServer(async (req, res) => {
 
   let m = path.match(/^\/sales\/(\d+)\/contacts$/);
   if (m) {
-    const all = contactsOf(Number(m[1]));
+    const all = contactsOf(Number(m[1]), url.searchParams.get('chat_type') ?? undefined);
     const page = Number(url.searchParams.get('page') || 1);
     const limit = Math.min(100, Number(url.searchParams.get('limit') || 25));
     return send(200, { data: all.slice((page - 1) * limit, page * limit), pagination: { page, limit, total: all.length, total_pages: Math.max(1, Math.ceil(all.length / limit)) } });
@@ -147,10 +154,11 @@ const aa = createServer(async (req, res) => {
   if (path === '/audital-work/runs/preflight' || path === '/audital-work/whatsapp-official/runs/preflight') {
     const sourceId = body.whatsapp_official_account_id ?? body.sales_id;
     if (path.includes('whatsapp-official') && (body.sales_id !== undefined || !body.whatsapp_official_account_id)) return send(400, { error: { code: 'invalid_source' } });
-    const total = mock.contacts[sourceId] ?? 10;
+    const selectedContacts = contactsOf(sourceId, body.filter?.chat_type);
+    const total = selectedContacts.length;
     // Hanya nomor yang benar-benar milik sales ini yang dihitung; is_excluded membalik artinya.
-    const own = new Set(contactsOf(sourceId).map((x) => x.phone_number));
-    const hit = (body.filter?.chat_numbers ?? []).filter((n: string) => own.has(n)).length;
+    const own = new Set(selectedContacts.map((x) => normalizeChatId(x.phone_number || x.chat_key)));
+    const hit = (body.filter?.chat_numbers ?? []).filter((n: string) => own.has(normalizeChatId(n))).length;
     if (body.filter?.chat_numbers?.length && body.filter?.is_excluded) {
       const left = total - hit;
       return send(200, { data: { can_start: left > 0, preview: { dataset: { filtered_contacts: left, filtered_messages: left * 10, token_after_filter: left * 1000 }, token_breakdown: { fixed_context_tokens: 500, total_context_tokens: left * 1000 + 500 }, context: { usable_context_length: 1_000_000, percent: 1 } } } });
@@ -914,7 +922,7 @@ test('filter kontak: hanya nomor tertentu, atau mengecualikannya; nomor 08… di
 
   const onlyChunk = await planOf(withContacts('only', paste, { mode: 'contacts', size: 2 }));
   assert.deepEqual(onlyChunk.units.map((u: any) => u.filter.chat_numbers.length), [2, 1]);
-  assert.match(onlyChunk.warnings.join(' '), /1 dari 4 nomor tidak punya chat/);
+  assert.match(onlyChunk.warnings.join(' '), /1 dari 4 nomor atau ID grup tidak punya chat/);
 
   // Dengan Chunk per hari: filter nomor ikut di setiap potongan tanggal.
   const exclDays = await planOf(withContacts('exclude', paste, { mode: 'days', size: 15 }));
@@ -922,6 +930,25 @@ test('filter kontak: hanya nomor tertentu, atau mengecualikannya; nomor 08… di
 
   const none = await call('POST', '/api/workflows', { name: 'x', company_id: 1, company_name: 'Mock', graph: withContacts('only', 'bukan nomor'), settings: {} });
   assert.match((await call('POST', `/api/workflows/${none.body.id}/runs`, { start_date: '2026-07-01', end_date: '2026-07-30' })).body.issues.join(' '), /daftar nomor.*masih kosong/);
+});
+
+test('filter grup tersimpan dan dijalankan utuh, termasuk ID lama bertanda hubung dan chunk kontak', async () => {
+  const g = graph({ sales: [4], chunk: { mode: 'contacts', size: 1 } });
+  Object.assign(g.nodes.find(n => n.id === 'a')!.config, { chatType: 'group', contactMode: 'only', contactNumbers: '120363123456789012@g.us\n6281234567890-1630000000' });
+  const id = await newRun(g);
+  const planned = await waitFor(id, ['awaiting_approval']);
+  assert.equal(planned.plan.units.length, 2);
+  assert.deepEqual(planned.plan.units.flatMap((u: any) => u.filter.chat_numbers).map(normalizeChatId).sort(), ['120363123456789012', '6281234567890-1630000000'].sort());
+  assert.equal((await call('POST', `/api/runs/${id}/approve`)).status, 200);
+  const done = await waitFor(id, ['completed']);
+  assert.equal(count(done, 'done'), 2);
+  for (const unit of done.units) {
+    const sent = mock.runs.get(unit.history_id)!.payload.filter;
+    assert.equal(sent.chat_type, 'group');
+    assert.equal(sent.is_excluded, false);
+    assert.equal(sent.chat_numbers.length, 1);
+    assert.deepEqual(sent, planned.plan.units.find((u: any) => u.seq === unit.seq).filter);
+  }
 });
 
 test('export terpisah: satu file per laporan, dibungkus zip, dinamai sales-periode-judul', async () => {

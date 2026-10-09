@@ -5,8 +5,9 @@ import { calendarIssues } from './calendar.ts';
 import {httpDestination,httpUrl} from './http.ts';
 export {AUTOBOT_BASE_URL,httpDestination,httpUrl} from './http.ts';
 export { parsePhones } from './phones.ts';
+export { normalizeChatId, parseChatIds } from './chat-ids.ts';
 export { DEFAULT_FILE_PATTERN, fileNameFrom, periodText, uniqueNames } from './filename.ts';
-import { parsePhones } from './phones.ts';
+import { parseChatIds } from './chat-ids.ts';
 
 // Katalog node: satu sumber kebenaran untuk kanvas (bentuk, port) dan mesin (validasi graf).
 // Tanpa dependensi supaya bisa diimpor browser maupun server.
@@ -442,8 +443,12 @@ export function validateGraph(graph: Graph): GraphIssue[] {
     }
     if (n.type === 'aw') for (const message of calendarIssues(c.analysisPeriod, c.analysisSchedule)) issues.push({ nodeId: n.id, message: `Proses AW: ${message}` });
     if (n.type === 'aw' && !String(c.model || '').trim()) issues.push({ nodeId: n.id, message: 'Proses AW: model belum dipilih.' });
-    if (n.type === 'aw' && (c.contactMode === 'only' || c.contactMode === 'exclude') && parsePhones(c.contactNumbers).numbers.length === 0) {
-      issues.push({ nodeId: n.id, message: `Proses AW: daftar nomor untuk "${c.contactMode === 'only' ? 'hanya nomor ini' : 'kecualikan nomor ini'}" masih kosong.` });
+    if (n.type === 'aw' && (c.contactMode === 'only' || c.contactMode === 'exclude')) {
+      const selected = parseChatIds(c.contactNumbers, c.chatType || 'individual');
+      if (selected.numbers.length === 0) issues.push({ nodeId: n.id, message: 'Proses AW: daftar nomor atau ID grup masih kosong.' });
+      if (selected.invalid.length) issues.push({ nodeId: n.id, message: 'Proses AW: ada nomor atau ID grup yang tidak valid. Perbaiki input sebelum menjalankan analisis.' });
+      if ((c.chatType || 'individual') === 'individual' && selected.groups.length) issues.push({ nodeId: n.id, message: 'Proses AW: daftar berisi ID grup. Pilih jenis chat "Hanya grup" atau "Private + grup".' });
+      if (c.chatType === 'group' && selected.groups.length < selected.numbers.length) issues.push({ nodeId: n.id, message: 'Proses AW: untuk "Hanya grup", tempel ID grup dari AutoAudit. Pilih "Private + grup" untuk daftar campuran.' });
     }
     if (n.type === 'chunk') {
       if (c.mode !== 'days' && c.mode !== 'contacts') issues.push({ nodeId: n.id, message: 'Chunk: mode harus per tanggal atau per kontak.' });

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { BaseEdge, EdgeLabelRenderer, getBezierPath, Handle, Position, useReactFlow } from '@xyflow/react';
 import type { EdgeProps, NodeProps } from '@xyflow/react';
-import { EXPORT_FORMATS, NODE_SPECS, parsePhones, httpUrl, PERIOD_LABELS } from '@nodes';
+import { EXPORT_FORMATS, NODE_SPECS, parseChatIds, httpUrl, PERIOD_LABELS } from '@nodes';
 import type { NodeType, Shape } from '@nodes';
 import { STATUS_LABEL } from './api.ts';
 
@@ -122,7 +122,7 @@ export function WorkflowNode({ data, selected }: NodeProps) {
       <ShapeSvg shape={spec.shape} w={w} h={h} fill={d.status ? 'var(--st-fill)' : `color-mix(in srgb, ${spec.color} 7%, white)`} stroke={d.hasIssue ? 'var(--bad)' : spec.color} dashed={spec.dashed} />
       {d.type === 'aw' && (d.config.contactMode === 'only' || d.config.contactMode === 'exclude') && (
         <span className={`node-tag ${d.config.contactMode}`} title="Filter kontak aktif di node ini">
-          {d.config.contactMode === 'only' ? 'hanya' : 'kecuali'} {parsePhones(d.config.contactNumbers).numbers.length} nomor
+          {d.config.contactMode === 'only' ? 'hanya' : 'kecuali'} {parseChatIds(d.config.contactNumbers, d.config.chatType || 'individual').numbers.length} chat
         </span>
       )}
       {d.hasIssue && <span className="node-flag" title="Node ini belum lengkap">!</span>}
