@@ -10,17 +10,24 @@ export interface NodeHelp {
 
 export const NODE_HELP = {
   trigger: {
-    tagline: 'Titik mulai workflow. Menanyakan rentang tanggal saat Run ditekan.',
-    when: 'Selalu ada, tepat satu per workflow. Rentang tanggal yang diisi saat Run berlaku untuk semua Proses AW.',
-    settings: ['Tidak ada pengaturan. Tanggal mulai dan selesai diisi setiap kali menjalankan.'],
+    tagline: 'Titik mulai workflow: manual, jadwal otomatis, atau webhook.',
+    when: 'Selalu ada, tepat satu per workflow. Tanggal saat Run berlaku untuk AW yang memilih “Ikuti tanggal saat Run”. Jadwal otomatis dapat diatur di Start.',
+    settings: ['Manual adalah default; tanggal dipilih saat Run.', 'Jadwal: harian, interval hari, hari mingguan, tanggal bulanan, akhir bulan, atau tanggal 1 dan 16; jam memakai WIB.', 'Webhook: POST ke URL Start dengan token Bearer. Tanggal opsional memakai periode Start; request_id mencegah run ganda.'],
     tips: ['Sambungkan ke node Sales supaya alur terbaca dari kiri ke kanan.'],
     example: [['trigger','sales','aw']],
   },
+  code: {
+    tagline:'Python atau JavaScript untuk transformasi data tanpa LLM.',
+    when:'Filter chat, pilih kolom, mapping, deduplikasi, pecah array, atau hitung rekap dengan kode sendiri. Dapat dipakai tanpa Proses AW.',
+    settings:['Pilih bahasa dan jalankan sekali untuk semua item atau per item.', 'Gunakan return untuk menghasilkan objek atau daftar item {json: {...}}.', 'Input dari Code, respons HTTP, laporan, atau baris tabel; dari Start memakai input JSON atau data webhook. Input file JSON dapat dibaca di panel.', 'Uji kode memakai input contoh tanpa menjalankan workflow atau memakai token LLM.'],
+    tips:['Rangkai beberapa Code untuk memisahkan filtering, perhitungan, dan penyusunan output.', 'Output tersedia sebagai JSON, baris tabel, dan teks untuk node hasil.', 'JavaScript memakai $input.all() / $json; Python memakai _input.all() / _json. Runtime tidak menyediakan file, jaringan, atau paket eksternal.'],
+    example:[['trigger','code','code','export'],['parse','code','sheets']],
+  },
   sales: {
-    tagline: 'Sumber chat: satu atau banyak sales WhatsApp dari company terpilih.',
-    when: 'Dipakai untuk menentukan chat siapa yang diaudit. Satu node boleh berisi banyak sales; tiap sales menjadi Audital Work sendiri.',
-    settings: ['Centang sales dari daftar. Daftar baru muncul setelah company dipilih di bilah atas.', 'Kotak cari menyaring berdasarkan nama atau nomor.'],
-    tips: ['Dua node Sales boleh disambung ke satu Proses AW; semuanya berjalan bersamaan dengan prompt yang sama.', 'Sales berstatus disconnected tetap bisa diaudit selama datanya pernah tersinkron.'],
+    tagline: 'Pilih Sales ID dan akun WhatsApp Official dari company terpilih.',
+    when: 'Menentukan sumber chat yang diaudit. Satu node bisa menggabungkan Sales ID dan akun Official; tiap sumber menjadi Audital Work sendiri.',
+    settings: ['Pilih jenis sumber Sales ID atau WhatsApp Official, lalu centang dari daftar company.', 'Ganti jenis sumber untuk menambah pilihan lain; pilihan sebelumnya tetap tersimpan.', 'Setiap pilihan menampilkan jenis sumber dan ID agar tidak tertukar.'],
+    tips: ['Dua node Sales boleh disambung ke satu Proses AW dengan prompt yang sama.', 'WhatsApp Official menggunakan chat private pada rentang tanggal terpilih dan melewati Sync Sales karena dataset akun dibaca langsung.'],
     example: [['sales','aw']],
   },
   prompt: {
@@ -57,6 +64,9 @@ export const NODE_HELP = {
     settings: [
       'Jalankan di Company: riwayat tersimpan di company dan memotong saldo kredit company.',
       'Jalankan di Superadmin: riwayat di sisi superadmin, saldo company tidak dipotong.',
+      'Periode analisis: tanggal khusus, H-1, H-7, beberapa hari terakhir, minggu lalu, bulan lalu, bulan berjalan, atau setengah bulan sebelumnya.',
+      'Atur cepat menyediakan jadwal setiap 2 hari, Senin, tanggal 1, akhir bulan, serta tanggal 1 dan 16. Aktifkan satu jadwal per workflow lalu Publish.',
+      'Jam jadwal adalah waktu mulai analisis dalam WIB. Hasil dikirim setelah selesai melalui node pengiriman. Matikan Konfirmasi sebelum jalan di bilah atas bila ingin berjalan tanpa persetujuan tiap run.',
       'Model, jenis chat (private / grup), jendela jam, dan batas waktu per Audital Work.',
       'Kontak yang dianalisis: semua, hanya nomor tertentu, atau semua kecuali nomor tertentu. Nomor cukup ditempel satu per baris (08…, +62…, atau 62…).',
     ],
@@ -195,7 +205,7 @@ Object.assign(NODE_HELP, {
     tagline: 'Mengirim hasil sebagai JSON ke sistem lain.',
     when: 'Dipakai untuk meneruskan hasil ke webhook n8n, aplikasi klien, atau layanan lain.',
     settings: ['URL tujuan dan metode (POST, PUT, PATCH).', 'Header tambahan, satu per baris: Nama: nilai.'],
-    tips: ['Isi yang dikirim: nama workflow, parameter run, daftar laporan (label, sumber, isi), dan tabel bila disambung dari Parse Tabel.', 'Balasan selain 2xx membuat run berhenti dan bisa dilanjutkan.'],
+    tips: ['Isi yang dikirim: nama workflow, parameter run, daftar laporan (label, sumber, isi), dan tabel bila disambung dari Parse Tabel.', 'Balasan selain 2xx membuat run berhenti dan bisa dilanjutkan. Respons JSON dapat diteruskan ke node Code.'],
     example: [['aw','http']],
   },
 } satisfies Partial<Record<NodeType, NodeHelp>>);
@@ -207,17 +217,19 @@ export const PORT_HELP: Record<PortType, { label: string; color: string; text: s
   memory: { label: 'Memory', color: '#0d9488', text: 'Pengetahuan tambahan.' },
   report: { label: 'Laporan', color: '#dc2626', text: 'Hasil tulisan AI dari tiap Audital Work.' },
   rows: { label: 'Baris', color: '#0369a1', text: 'Baris tabel hasil Parse Tabel.' },
+  data: {label:'Data JSON',color:'#b45309',text:'Item JSON hasil Code, untuk transformasi berikutnya atau node hasil.'},
   file: { label: 'File', color: '#15803d', text: 'File hasil export.' },
 };
 
 export const GROUPS: { title: string; hint: string; types: NodeType[] }[] = [
   { title: 'Mulai & sumber', hint: 'apa yang diaudit', types: ['trigger', 'sales', 'prompt', 'memory'] },
   { title: 'Ambil hasil yang ada', hint: 'tanpa menjalankan audit', types: ['history', 'continuous'] },
-  { title: 'Proses', hint: 'yang dikerjakan', types: ['sync', 'chunk', 'aw', 'aimerge', 'merge', 'parse'] },
+  { title: 'Proses', hint: 'yang dikerjakan', types: ['code', 'sync', 'chunk', 'aw', 'aimerge', 'merge', 'parse'] },
   { title: 'Hasil', hint: 'ke mana keluarnya', types: ['viewer', 'export', 'sheets', 'message', 'http'] },
 ];
 
 export const RECIPES: { title: string; flow: NodeType[]; side?: NodeType[]; note: string }[] = [
+  {title:'Filter & rekap tanpa LLM',flow:['trigger','code','code','export'],note:'JSON dari input atau webhook difilter dan dihitung dengan Python/JavaScript, lalu diexport. Tidak perlu Proses AW.'},
   { title: 'Audit sederhana', flow: ['trigger', 'sales', 'aw'], side: ['prompt'], note: 'Satu Audital Work per sales untuk seluruh periode. Prompt disambung ke titik atas Proses AW.' },
   { title: 'Periode panjang', flow: ['trigger', 'sales', 'chunk', 'aw', 'export'], side: ['prompt'], note: 'Periode dipecah, tabel dari semua bagian digabung ke satu file.' },
   { title: 'Satu laporan utuh dari periode panjang', flow: ['trigger', 'sales', 'chunk', 'aw', 'aimerge', 'export'], side: ['prompt'], note: 'Tiap bagian diaudit sendiri, lalu semua laporannya digabung AI menjadi satu.' },

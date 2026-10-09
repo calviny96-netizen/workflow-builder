@@ -1,6 +1,7 @@
 // Langkah hilir: node yang dikerjakan server setelah Audital Work di hulunya selesai.
 // Saat ini Parse Tabel dan Export. Semuanya cepat dan lokal, kecuali PDF yang dirender AutoAudit.
 
+import { executeCode, codeItems } from './code.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
@@ -62,7 +63,7 @@ async function mergedInto(ctx: StepContext, run: any, nodeId: string): Promise<R
   const graph: Graph = run.graph;
   const ids = incoming(graph, nodeId, 'in')
     .map((e) => graph.nodes.find((n) => n.id === e.source))
-    .filter((n) => n?.type === 'merge' || n?.type === 'aimerge')
+    .filter((n) => n?.type === 'merge' || n?.type === 'aimerge' || n?.type === 'code' || n?.type === 'http')
     .map((n) => n!.id);
   if (!ids.length) return [];
   const r = await ctx.db.query(`select output->'report' as report from steps where run_id=$1 and node_id = any($2) and status='done'`, [run.id, ids]);
@@ -115,11 +116,27 @@ async function tablesInto(ctx: StepContext, run: any, nodeId: string): Promise<M
   const graph: Graph = run.graph;
   const parseIds = incoming(graph, nodeId, 'in')
     .map((e) => graph.nodes.find((n) => n.id === e.source))
-    .filter((n) => n?.type === 'parse')
+    .filter((n) => n?.type === 'parse' || n?.type === 'code' || n?.type === 'http')
     .map((n) => n!.id);
   if (!parseIds.length) return [];
   const r = await ctx.db.query(`select output from steps where run_id=$1 and node_id = any($2) and status='done' order by node_id`, [run.id, parseIds]);
   return r.rows.flatMap((s) => s.output?.tables ?? []);
+}
+
+export async function runCode(ctx: StepContext, run: any, node: GraphNode) {
+  const graph: Graph = run.graph;
+  const from = incoming(graph,node.id,'in').map(e=>graph.nodes.find(n=>n.id===e.source)!);
+  const codeIds = from.filter(n=>n.type==='code' || n.type==='http').map(n=>n.id);
+  const prior = codeIds.length ? (await ctx.db.query("select output from steps where run_id=$1 and node_id=any($2) and status='done' order by node_id",[run.id,codeIds])).rows.flatMap(r=>r.output?.items ?? []) : [];
+  // Code outputs are already structured; do not feed their text/table adapters back as duplicate input.
+  const nonCodeGraph = {...graph,edges:graph.edges.filter(e=>!codeIds.includes(e.source))};
+  const adaptedReports = await reportsInto(ctx,{...run,graph:nonCodeGraph},node.id);
+  const adaptedTables = await tablesInto(ctx,{...run,graph:nonCodeGraph},node.id);
+  const rows = adaptedTables.flatMap(t=>t.rows.map(row=>({json:Object.fromEntries(t.columns.map((key,i)=>[key,row[i] ?? '']))})));
+  const reports = adaptedReports.map(r=>({json:{label:r.label,source:r.sourceName,content:r.content,period:r.period}}));
+  const hasDataSource = from.some(n=>n.type!=='trigger');
+  const items = hasDataSource ? [...prior,...rows,...reports] : run.params.items !== undefined ? codeItems(run.params.items) : codeItems(JSON.parse(node.config.inputJson || '[]'));
+  return executeCode(node.config,items,{start_date:run.params.start_date,end_date:run.params.end_date,analysis_date:run.params.analysis_date,company_id:run.company_id,workflow:run.workflow_name});
 }
 
 async function runParse(ctx: StepContext, run: any, node: GraphNode) {
@@ -309,10 +326,15 @@ async function runMessage(ctx: StepContext, run: any, node: GraphNode) {
 }
 
 async function runHttp(ctx: StepContext, run: any, node: GraphNode) {
+  const savedKey = ctx.masterKey ? await readSecret(ctx.db, ctx.masterKey, run.workflow_id, node.id, 'autobotApiKey') : null;
+  node = {...node, config:{...node.config, autobotApiKey:savedKey || node.config.autobotApiKey}};
   const [reports, tables, files] = await Promise.all([reportsInto(ctx, run, node.id), tablesInto(ctx, run, node.id), filesInto(ctx, run, node.id)]);
+  const codeIds = incoming(run.graph,node.id,'in').map(e=>run.graph.nodes.find((n:GraphNode)=>n.id===e.source)).filter(n=>n?.type==='code' || n?.type==='http').map(n=>n!.id);
+  const items = codeIds.length ? (await ctx.db.query("select output->'items' as items from steps where run_id=$1 and node_id=any($2) and status='done' order by node_id",[run.id,codeIds])).rows.flatMap(r=>r.items ?? []) : undefined;
   return sendHttp(
     node,
     {
+      ...(items ? {items} : {}),
       workflow: run.workflow_name,
       run_id: run.id,
       company_id: run.company_id,
@@ -432,7 +454,9 @@ export async function runReadySteps(ctx: StepContext, log: (m: string) => void) 
         }
         try {
           const output =
-            node.type === 'parse'
+            node.type === 'code'
+              ? await runCode(ctx, run, node)
+              : node.type === 'parse'
               ? await runParse(ctx, run, node)
               : node.type === 'sheets'
                 ? await runSheets(ctx, run, node)

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { BaseEdge, EdgeLabelRenderer, getBezierPath, Handle, Position, useReactFlow } from '@xyflow/react';
 import type { EdgeProps, NodeProps } from '@xyflow/react';
-import { EXPORT_FORMATS, NODE_SPECS, parsePhones } from '@nodes';
+import { EXPORT_FORMATS, NODE_SPECS, parsePhones, httpUrl, PERIOD_LABELS } from '@nodes';
 import type { NodeType, Shape } from '@nodes';
 import { STATUS_LABEL } from './api.ts';
 
@@ -62,7 +62,8 @@ export function ShapeSvg({ shape, w, h, fill, stroke, dashed }: { shape: Shape; 
 function summary(type: NodeType, c: Record<string, any>): string {
   if (type === 'sales') {
     const n = c.sales?.length ?? 0;
-    return n === 0 ? 'belum dipilih' : n === 1 ? c.sales[0].name : `${n} sales`;
+    const official = (c.sales ?? []).filter((s: any) => s.channel === 'whatsapp_official').length;
+    return n === 0 ? 'belum dipilih' : n === 1 ? `${c.sales[0].name}${official ? ' · Official' : ''}` : `${n - official} sales · ${official} Official`;
   }
   if (type === 'prompt') return c.mode === 'text' ? 'teks bebas' : c.title || 'belum dipilih';
   if (type === 'memory') return `${c.memories?.length ?? 0} memory`;
@@ -70,8 +71,9 @@ function summary(type: NodeType, c: Record<string, any>): string {
     const unit = c.mode === 'contacts' ? 'kontak' : 'hari';
     return c.size ? `per ${c.size} ${unit}` : `per ${unit} · usulan`;
   }
-  if (type === 'aw') return `${String(c.model || 'model?').split('/').pop()} · ${c.runBySuperadmin ? 'Superadmin' : 'Company'}`;
-  if (type === 'trigger') return 'rentang tanggal';
+  if (type === 'aw') return c.analysisPeriod && c.analysisPeriod.mode !== 'run' ? `${c.analysisSchedule?.enabled ? '◷ ' : ''}${PERIOD_LABELS[c.analysisPeriod.mode as keyof typeof PERIOD_LABELS] ?? 'periode?'} · ${String(c.model || 'model?').split('/').pop()}` : `${String(c.model || 'model?').split('/').pop()} · ${c.runBySuperadmin ? 'Superadmin' : 'Company'}`;
+  if (type === 'code') return `${c.language === 'python' ? 'Python' : 'JavaScript'} · ${c.runMode === 'each' ? 'per item' : 'semua item'}`;
+  if (type === 'trigger') return c.mode === 'webhook' ? 'webhook' : c.mode === 'schedule' ? `jadwal ${c.triggerSchedule?.frequency ?? 'daily'} · ${c.triggerSchedule?.time ?? '08:00'} WIB` : 'manual · rentang tanggal';
   if (type === 'parse') return c.tables === 'first' ? 'tabel pertama' : 'semua tabel';
   if (type === 'export') return `${EXPORT_FORMATS[c.format]?.label ?? 'format?'} · ${c.split === 'combined' ? 'digabung' : 'per laporan'}`;
   if (type === 'merge') return c.title || 'lewat AutoAudit';
@@ -82,7 +84,7 @@ function summary(type: NodeType, c: Record<string, any>): string {
   if (type === 'message') return c.target ? `ke ${c.target}` : 'tujuan?';
   if (type === 'http') {
     try {
-      return new URL(c.url).host;
+      return new URL(httpUrl(c)).host;
     } catch {
       return 'URL?';
     }
@@ -126,7 +128,7 @@ export function WorkflowNode({ data, selected }: NodeProps) {
       {d.hasIssue && <span className="node-flag" title="Node ini belum lengkap">!</span>}
       <div className="wf-node-body">
         <div className="wf-node-title" style={{ color: spec.color }}>
-          {spec.label}
+          {d.type === 'code' && d.config.title ? d.config.title : spec.label}
         </div>
         <div className="wf-node-sub">{d.status ? (STATUS_LABEL[d.status] ?? d.status) : summary(d.type, d.config)}</div>
       </div>

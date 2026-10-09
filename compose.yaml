@@ -1,0 +1,72 @@
+name: autoaudit-workflow-builder
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aawb
+      POSTGRES_PASSWORD: aawb-local
+      POSTGRES_DB: aawb
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aawb -d aawb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      default:
+      n8n:
+        aliases: [autoaudit-postgres]
+
+  server:
+    build:
+      context: .
+      target: server
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      NODE_ENV: development
+      PUBLIC_HOSTNAME: wokflowbuilder.dbautoaudit.stream
+      DATABASE_URL: postgres://aawb:aawb-local@postgres:5432/aawb
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - server-data:/app/.data
+      - ./.secrets:/app/.secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      default:
+      n8n:
+        aliases: [autoaudit-server]
+
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - "127.0.0.1:5173:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  server-data:
+
+networks:
+  n8n:
+    external: true
+    name: n8n_default

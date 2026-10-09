@@ -8,6 +8,8 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, test } from 'node:test';
+import { mkdir, writeFile, access } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
@@ -78,6 +80,7 @@ const aa = createServer(async (req, res) => {
   settle();
 
   if (path === '/audital-work/models') return send(200, { data: { items: [{ model_name: 'mock/model', is_enabled: 1 }], summary: { default_model: 'mock/model' } } });
+  if (path === '/audital-work/whatsapp-official/accounts') return send(200, { data: { items: [{ id: 1, name: 'Official 1', display_phone_number: '+62 811', local_status: 'connected' }] } });
   if (path === '/audital-work/saved-prompts') return send(200, { data: { items: [{ id: 7, title: 'Komplain', content: mock.promptContent }] } });
   if (path === '/notifications') {
     const group = url.searchParams.get('group');
@@ -141,10 +144,12 @@ const aa = createServer(async (req, res) => {
     return send(200, { data: all.slice((page - 1) * limit, page * limit), pagination: { page, limit, total: all.length, total_pages: Math.max(1, Math.ceil(all.length / limit)) } });
   }
 
-  if (path === '/audital-work/runs/preflight') {
-    const total = mock.contacts[body.sales_id] ?? 10;
+  if (path === '/audital-work/runs/preflight' || path === '/audital-work/whatsapp-official/runs/preflight') {
+    const sourceId = body.whatsapp_official_account_id ?? body.sales_id;
+    if (path.includes('whatsapp-official') && (body.sales_id !== undefined || !body.whatsapp_official_account_id)) return send(400, { error: { code: 'invalid_source' } });
+    const total = mock.contacts[sourceId] ?? 10;
     // Hanya nomor yang benar-benar milik sales ini yang dihitung; is_excluded membalik artinya.
-    const own = new Set(contactsOf(body.sales_id).map((x) => x.phone_number));
+    const own = new Set(contactsOf(sourceId).map((x) => x.phone_number));
     const hit = (body.filter?.chat_numbers ?? []).filter((n: string) => own.has(n)).length;
     if (body.filter?.chat_numbers?.length && body.filter?.is_excluded) {
       const left = total - hit;
@@ -167,7 +172,8 @@ const aa = createServer(async (req, res) => {
     });
   }
 
-  if (path === '/audital-work/runs' && req.method === 'POST') {
+  if ((path === '/audital-work/runs' || path === '/audital-work/whatsapp-official/runs') && req.method === 'POST') {
+    if (path.includes('whatsapp-official') && (body.sales_id !== undefined || !body.whatsapp_official_account_id)) return send(400, { error: { code: 'invalid_source' } });
     mock.posts += 1;
     const key = `${body.sales_id}|${body.filter.start_date}`;
     const id = mock.nextId++;
@@ -362,7 +368,7 @@ before(async () => {
   await migrate(db);
   await db.query('insert into users (email, password_hash) values ($1,$2)', ['uji@local.test', await hashPassword('uji-lokal')]);
   executor = makeExecutor();
-  app = buildApp({ db, api, executor, masterKey, fetch: fakeFetch, globalConcurrency: 5, secureCookie: false });
+  app = buildApp({ db, api, executor, filesDir, masterKey, fetch: fakeFetch, globalConcurrency: 5, secureCookie: false, publicHostname: 'wokflowbuilder.dbautoaudit.stream' });
   await app.ready();
   executor.start();
 });
@@ -389,7 +395,29 @@ test('graf tidak lengkap ditolak saat run', async () => {
   const w = await call('POST', '/api/workflows', { name: 'rusak', company_id: 1, company_name: 'Mock', graph: g, settings: {} });
   const r = await call('POST', `/api/workflows/${w.body.id}/runs`, { start_date: '2026-07-01', end_date: '2026-07-30' });
   assert.equal(r.status, 400);
-  assert.match(r.body.issues.join(' '), /belum ada sales/);
+  assert.match(r.body.issues.join(' '), /belum ada Sales ID atau akun WhatsApp Official/);
+});
+
+test('Sales ID dan Official dengan angka yang sama: daftar akun, simpan, estimasi, eksekusi, polling, dan laporan', async () => {
+  const list = await call('GET', '/api/aa/official-accounts?company_id=1&q=Official');
+  assert.equal(list.status, 200);
+  assert.equal(list.body.items[0].channel, 'whatsapp_official');
+  assert.equal(list.body.items[0].id, 1);
+  assert.equal((await call('GET', '/api/aa/official-accounts?company_id=1&q=tidak-ada')).body.items.length, 0);
+  const g = graph({ sales: [1] });
+  g.nodes.find((n) => n.id === 's')!.config.sales.push({ id: 1, name: 'Official 1', channel: 'whatsapp_official' });
+  const id = await newRun(g);
+  const planned = await waitFor(id, ['awaiting_approval']);
+  assert.deepEqual(planned.plan.units.map((u: any) => u.source.channel), ['whatsapp', 'whatsapp_official']);
+  assert.equal((await call('POST', `/api/runs/${id}/approve`)).status, 200);
+  const done = await waitFor(id, ['completed']);
+  assert.equal(count(done, 'done'), 2);
+  const official = done.units.find((u: any) => u.source.channel === 'whatsapp_official');
+  const payload = mock.runs.get(official.history_id)!.payload;
+  assert.equal(payload.whatsapp_official_account_id, 1);
+  assert.equal(payload.sales_id, undefined);
+  const report = await call('GET', `/api/units/${official.id}`);
+  assert.match(report.body.content, /Laporan/);
 });
 
 test('2 sales x 30 hari per 5 hari: 12 AW, maksimal 5 bersamaan, semua selesai', async () => {
@@ -1117,4 +1145,92 @@ test('Merge AI → Export PDF: satu PDF dari laporan gabungan', async () => {
   assert.equal(mock.pdfBodies[0].metaInfo.token, 200);
   const file = await app.inject({ method: 'GET', url: `/api/steps/${stepOf(done, 'x').id}/file`, headers: { cookie } });
   assert.equal(file.headers['content-type'], 'application/pdf');
+});
+
+
+test('Workflow lifecycle: publish, edit kembali Draft, unpublish, arsip read-only dan pulihkan; setting tersimpan di PostgreSQL', async () => {
+  const body = { name: 'Lifecycle persistence', company_id: 1, company_name: 'Mock', graph: graph({ sales: [1] }), settings: { concurrency: 3, requireApproval: true } };
+  const created = await call('POST', '/api/workflows', body);
+  assert.equal(created.status, 200);
+  const id = created.body.id;
+  const lifecycle = (action: string) => call('POST', `/api/workflows/${id}/lifecycle`, { action });
+  assert.equal(created.body.status, 'draft');
+  assert.equal((await call('POST', `/api/workflows/${id}/runs`, { start_date: '2026-07-01', end_date: '2026-07-02', mode: 'published' })).status, 409);
+  assert.equal((await lifecycle('publish')).body.status, 'published');
+  assert.equal((await call('PUT', `/api/workflows/${id}`, body)).body.status, 'published', 'autosave identik mempertahankan publish');
+  body.settings.concurrency = 4;
+  assert.equal((await call('PUT', `/api/workflows/${id}`, body)).body.status, 'draft');
+  assert.equal((await lifecycle('publish')).body.status, 'published');
+  const publishedRun = await call('POST', `/api/workflows/${id}/runs`, { start_date: '2026-07-01', end_date: '2026-07-02', mode: 'published' });
+  assert.equal(publishedRun.status, 200);
+  await waitFor(publishedRun.body.id, ['awaiting_approval']);
+  await call('POST', `/api/runs/${publishedRun.body.id}/cancel`);
+  assert.equal((await lifecycle('unpublish')).body.status, 'draft');
+  const separatePool = createPool(testUrl);
+  assert.deepEqual((await separatePool.query('select settings from workflows where id=$1', [id])).rows[0].settings, body.settings);
+  await separatePool.end();
+  assert.equal((await call('DELETE', `/api/workflows/${id}`, { confirmation: 'DELETE' })).status, 409, 'wajib arsip');
+  assert.equal((await lifecycle('archive')).body.status, 'archived');
+  assert.equal((await call('PUT', `/api/workflows/${id}`, body)).status, 409);
+  assert.equal((await lifecycle('publish')).status, 409);
+  assert.equal((await call('POST', `/api/workflows/${id}/runs`, { start_date: '2026-07-01', end_date: '2026-07-02' })).status, 409);
+  assert.equal((await lifecycle('restore')).body.status, 'draft');
+  assert.deepEqual((await call('GET', `/api/workflows/${id}`)).body.settings, body.settings);
+  await lifecycle('archive');
+  assert.equal((await call('DELETE', `/api/workflows/${id}`)).status, 400);
+  assert.equal((await call('DELETE', `/api/workflows/${id}`, { confirmation: 'delete' })).status, 400);
+  assert.equal((await call('DELETE', `/api/workflows/${id}`, { confirmation: 'DELETE' })).status, 200);
+  assert.equal((await call('GET', `/api/workflows/${id}`)).status, 404);
+  assert.equal((await call('DELETE', `/api/workflows/${id}`, { confirmation: 'DELETE' })).status, 404);
+});
+
+test('Workflow: publish ditolak untuk graf tidak lengkap; arsip menolak run menunggu persetujuan', async () => {
+  const empty = await call('POST', '/api/workflows', { name: 'Incomplete', company_id: 1, graph: { nodes: [], edges: [] } });
+  assert.equal((await call('POST', `/api/workflows/${empty.body.id}/lifecycle`, { action: 'publish' })).status, 400);
+  const { w, r } = await runWorkflow(graph({ sales: [1] }));
+  await waitFor(r.body.id, ['awaiting_approval']);
+  assert.equal((await call('POST', `/api/workflows/${w.id}/lifecycle`, { action: 'archive' })).status, 409);
+  await call('POST', `/api/runs/${r.body.id}/cancel`);
+  assert.equal((await call('POST', `/api/workflows/${w.id}/lifecycle`, { action: 'archive' })).status, 200);
+  assert.equal((await call('POST', `/api/runs/${r.body.id}/replan`, { overrides: {} })).status, 409);
+});
+
+test('Permanent delete: cascade run, unit, step, node secret dan file; cleanup antrean pulih saat restart', async () => {
+  const { w, r } = await runWorkflow(aiMergeGraph([1], { apiKey: 'sk-or-benar-1234' }));
+  await waitFor(r.body.id, ['awaiting_approval']);
+  await call('POST', `/api/runs/${r.body.id}/approve`);
+  const done = await waitFor(r.body.id, ['completed']);
+  assert.ok(done.units.length);
+  const dir = join(filesDir, r.body.id);
+  await access(dir);
+  assert.equal((await db.query('select count(*)::int n from node_secrets where workflow_id=$1', [w.id])).rows[0].n, 1);
+  await call('POST', `/api/workflows/${w.id}/lifecycle`, { action: 'archive' });
+  assert.equal((await call('DELETE', `/api/workflows/${w.id}`, { confirmation: 'DELETE' })).status, 200);
+  await assert.rejects(access(dir));
+  for (const table of ['runs','units','steps']) {
+    const column = table === 'runs' ? 'id' : 'run_id';
+    assert.equal((await db.query(`select count(*)::int n from ${table} where ${column}=$1`, [r.body.id])).rows[0].n, 0);
+  }
+  assert.equal((await db.query('select count(*)::int n from node_secrets where workflow_id=$1', [w.id])).rows[0].n, 0);
+  // Simulasi shutdown setelah commit delete sebelum cleanup filesystem.
+  const orphan = '11111111-1111-4111-8111-111111111111';
+  await mkdir(join(filesDir, orphan), { recursive: true });
+  await writeFile(join(filesDir, orphan, 'report.txt'), 'fixture');
+  await db.query('insert into file_cleanup(run_id) values ($1)', [orphan]);
+  const restarted = buildApp({ db, api, executor, filesDir, masterKey, globalConcurrency: 5, secureCookie: false });
+  await restarted.ready();
+  await assert.rejects(access(join(filesDir, orphan)));
+  assert.equal((await db.query('select count(*)::int n from file_cleanup')).rows[0].n, 0);
+  await restarted.close();
+});
+
+
+test('HTTPS publik memakai Secure cookie; login localhost tetap dapat digunakan', async () => {
+  const payload = { email: 'uji@local.test', password: 'uji-lokal' };
+  const publicLogin = await app.inject({ method: 'POST', url: '/api/auth/login', headers: { host: 'wokflowbuilder.dbautoaudit.stream' }, payload });
+  assert.equal(publicLogin.statusCode, 200);
+  assert.match(String(publicLogin.headers['set-cookie']), /; Secure(?:;|$)/i);
+  const localLogin = await app.inject({ method: 'POST', url: '/api/auth/login', headers: { host: '127.0.0.1:8787' }, payload });
+  assert.equal(localLogin.statusCode, 200);
+  assert.doesNotMatch(String(localLogin.headers['set-cookie']), /; Secure(?:;|$)/i);
 });

@@ -113,7 +113,14 @@ create table if not exists steps (
 
 export async function migrate(db: Db) {
   await db.query(SCHEMA);
+  await db.query(`alter table workflows add column if not exists status text not null default 'draft'
+    check (status in ('draft','published','archived'))`);
+  await db.query(`alter table workflows add column if not exists published_at timestamptz`);
+  await db.query(`alter table workflows add column if not exists archived_at timestamptz`);
+  await db.query(`create table if not exists file_cleanup (run_id uuid primary key, created_at timestamptz not null default now())`);
+  await db.query(`create index if not exists workflows_status_idx on workflows(status, updated_at desc)`);
   await db.query(`alter table runs add column if not exists preview jsonb`);
   await db.query(`alter table units add column if not exists meta jsonb`);
   await db.query(`alter table runs add column if not exists chunk_confirmed boolean not null default false`);
+  await db.query(`create unique index if not exists runs_schedule_occurrence_idx on runs(workflow_id, (params->>'schedule_key')) where params ? 'schedule_key'`);
 }

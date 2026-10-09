@@ -10,7 +10,7 @@ import { fromGraph } from './Editor.tsx';
 import { HelpDrawer } from './HelpDrawer.tsx';
 import { nodeTypes } from './shapes.tsx';
 
-const STEP_NAME: Record<string, string> = { parse: 'Parse Tabel', sheets: 'Tulis Sheets', sync: 'Sync Sales', message: 'Kirim GOWA', http: 'HTTP Request', merge: 'Merge AutoAudit', aimerge: 'Merge AI' };
+const STEP_NAME: Record<string, string> = { code:'Code', parse: 'Parse Tabel', sheets: 'Tulis Sheets', sync: 'Sync Sales', message: 'Kirim GOWA', http: 'HTTP Request', merge: 'Merge AutoAudit', aimerge: 'Merge AI' };
 const TERMINAL = ['completed', 'cancelled', 'plan_failed'];
 const GROUP_LIMIT = 12; // di atas ini ketupat ditumpuk jadi satu grup yang bisa dibuka
 const ROWS = 8;
@@ -229,7 +229,7 @@ function StepPanel({ step }: { step: any }) {
   const [detail, setDetail] = useState<any>(null);
   useEffect(() => {
     setDetail(null);
-    if (step.status === 'done' && (step.type === 'parse' || step.type === 'merge' || step.type === 'aimerge')) api('GET', `/api/steps/${step.id}`).then(setDetail).catch(() => {});
+    if (step.status === 'done' && (step.type === 'parse' || step.type === 'merge' || step.type === 'aimerge' || step.type === 'code')) api('GET', `/api/steps/${step.id}`).then(setDetail).catch(() => {});
   }, [step.id, step.status]);
   const sum = step.summary;
   return (
@@ -240,7 +240,11 @@ function StepPanel({ step }: { step: any }) {
         <span className={`badge st-${step.status}`}>{STATUS_LABEL[step.status] ?? step.status}</span>
       </div>
       {step.status === 'waiting' && step.type !== 'sync' && <p className="muted small">Menunggu langkah di hulunya selesai.</p>}
-      {sum?.kind === 'sync' && (
+      {sum?.kind === 'code' && <>
+        <p className="small">{sum.language === 'python' ? 'Python' : 'JavaScript'} · {sum.input} item masuk → {sum.items} item keluar · 0 token LLM</p>
+        {detail && <><div className="row"><button className="btn small" onClick={()=>navigator.clipboard.writeText(JSON.stringify(detail.items,null,2))}>Salin JSON</button><button className="btn small" onClick={()=>download('hasil-code.json',JSON.stringify(detail.items,null,2))}>Unduh pratinjau JSON</button></div><pre className="code-output">{JSON.stringify(detail.items,null,2)}</pre>{detail.totalItems>detail.items.length && <p className="muted small">Menampilkan {detail.items.length} dari {detail.totalItems} item. Sambungkan Export untuk semua baris.</p>}{detail.logs?.length>0 && <><strong>Log</strong><pre className="code-output">{detail.logs.join('\n')}</pre></>}</>}
+      </>}
+      {sum?.kind === 'sync'  && (
         <div className="unit-list">
           {sum.jobs.map((j: any, k: number) => (
             <div className="unit-row" key={k} style={{ cursor: 'default' }}>
@@ -421,7 +425,7 @@ function ChunkStep({ run, sizes, setSizes, busy, onNext }: { run: any; sizes: Re
     // Usulan paling ketat di antara semua sales pada node ini.
     const rec = Math.min(...groups.map((g) => (mode === 'contacts' ? g.chunk.recommended.contactsPerPart : g.chunk.recommended.daysPerPart)));
     const size = sizes[nodeId] ?? rec;
-    const parts = (g: any) => (g.chunk.full.contacts === 0 ? 0 : mode === 'contacts' ? Math.ceil(g.chunk.full.contacts / size) : Math.ceil(pv.days / size));
+    const parts = (g: any) => (g.chunk.full.contacts === 0 ? 0 : mode === 'contacts' ? Math.ceil(g.chunk.full.contacts / size) : Math.ceil((g.period?.days ?? pv.days) / size));
     const aw = groups.reduce((n, g) => n + parts(g), 0);
     totalAw += aw;
     return (
@@ -444,7 +448,7 @@ function ChunkStep({ run, sizes, setSizes, busy, onNext }: { run: any; sizes: Re
           <tbody>
             {groups.map((g, k) => (
               <tr key={k}>
-                <td>{g.source.name}</td>
+                <td>{g.source.name}{g.period && <div className="muted small">{g.period.start_date} – {g.period.end_date}</div>}</td>
                 <td>{fmt(g.chunk.full.contacts)}</td>
                 <td>{fmt(g.chunk.full.messages)}</td>
                 <td>{fmt(g.chunk.full.tokens)}</td>
@@ -492,7 +496,7 @@ function ChunkStep({ run, sizes, setSizes, busy, onNext }: { run: any; sizes: Re
         </div>
       </div>
       <p className="muted small">
-        Periode {run.params.start_date} s/d {run.params.end_date} ({pv.days} hari). Angka dibaca dari AutoAudit tanpa memakai token AI.
+        Periode tiap AW ditampilkan bersama sumbernya. Angka dibaca dari AutoAudit tanpa memakai token AI.
       </p>
       {cards}
       {plain.length > 0 && (
@@ -640,7 +644,7 @@ export function RunView({ workflowId, runId }: { workflowId: string; runId: stri
         <strong>{run.workflow_name}</strong>
         <span className="muted">
           {run.company_name}
-          {nRun > 0 || run.status === 'planning' || run.status === 'awaiting_chunk' ? ` · ${run.params.start_date} s/d ${run.params.end_date}` : ''}
+          {nRun > 0 || run.status === 'planning' || run.status === 'awaiting_chunk' ? run.graph.nodes.some((n: any) => n.type === 'aw' && n.config.analysisPeriod && n.config.analysisPeriod.mode !== 'run') ? ` · Periode sesuai node AW · acuan ${run.params.analysis_date ?? run.params.start_date}` : ` · ${run.params.start_date} s/d ${run.params.end_date}` : ''}
         </span>
         <span className={`badge st-${run.status}`}>{STATUS_LABEL[run.status] ?? run.status}</span>
         {items.length > 0 && run.status !== 'awaiting_approval' && (
@@ -817,7 +821,7 @@ export function RunView({ workflowId, runId }: { workflowId: string; runId: stri
                       <tbody>
                         {run.plan.groups.map((g: any, k: number) => (
                           <tr key={k}>
-                            <td>{g.source.name}</td>
+                            <td>{g.source.name}{g.period && <div className="muted small">{g.period.start_date} – {g.period.end_date}</div>}</td>
                             <td>{g.units}</td>
                             <td className="muted">
                               {g.chunk ? `${fmt(g.chunk.full.contacts)} kontak · ${fmt(g.chunk.full.tokens)} token · ${g.chunk.full.percent}%${g.chunk.full.needsChunking ? ' · wajib dipecah' : ''}` : ['history', 'continuous'].includes(g.source.channel) ? 'laporan yang sudah ada' : 'tanpa chunk'}

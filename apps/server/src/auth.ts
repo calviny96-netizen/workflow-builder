@@ -50,21 +50,36 @@ export async function logout(db: Db, token: string | undefined) {
   if (token) await db.query('delete from sessions where token = $1', [token]);
 }
 
-// .env adalah sumber kebenaran untuk admin: bila ADMIN_EMAIL dan ADMIN_PASSWORD diisi, user itu
-// dibuat atau password-nya disamakan setiap server hidup. Mengganti password cukup lewat .env.
+export async function updateAccount(db: Db, userId: string, token: string, email: string, currentPassword: string, newPassword?: string): Promise<SessionUser | null> {
+  const client = await db.connect();
+  try {
+    await client.query('begin');
+    const user = (await client.query('select id, name, password_hash from users where id = $1 for update', [userId])).rows[0];
+    if (!user || !(await verifyPassword(currentPassword, user.password_hash))) {
+      await client.query('rollback');
+      return null;
+    }
+    const hash = newPassword ? await hashPassword(newPassword) : user.password_hash;
+    const updated = (await client.query('update users set email = $2, password_hash = $3 where id = $1 returning id, email, name', [userId, email, hash])).rows[0];
+    await client.query('delete from sessions where user_id = $1 and token <> $2', [userId, token]);
+    await client.query('commit');
+    return updated;
+  } catch (err) {
+    await client.query('rollback');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// .env hanya membuat admin pertama. Perubahan akun di aplikasi bertahan saat restart.
 export async function seedAdmin(db: Db, email: string | undefined, password: string | undefined): Promise<string | null> {
+  const count = await db.query('select count(*)::int as n from users');
+  if (count.rows[0].n > 0) return null;
   if (!email || !password) {
-    const count = await db.query('select count(*)::int as n from users');
-    return count.rows[0].n > 0 ? null : 'Belum ada user. Isi ADMIN_EMAIL dan ADMIN_PASSWORD di .env lalu jalankan ulang server.';
+    return 'Belum ada user. Isi ADMIN_EMAIL dan ADMIN_PASSWORD di .env lalu jalankan ulang server.';
   }
   const addr = email.trim().toLowerCase();
-  const existing = (await db.query('select id, password_hash from users where email = $1', [addr])).rows[0];
-  if (!existing) {
-    await db.query('insert into users (email, name, password_hash) values ($1, $2, $3)', [addr, 'Admin', await hashPassword(password)]);
-    return `User admin dibuat: ${addr}`;
-  }
-  if (await verifyPassword(password, existing.password_hash)) return null;
-  await db.query('update users set password_hash = $2 where id = $1', [existing.id, await hashPassword(password)]);
-  await db.query('delete from sessions where user_id = $1', [existing.id]);
-  return `Password ${addr} disamakan dengan .env.`;
+  await db.query('insert into users (email, name, password_hash) values ($1, $2, $3)', [addr, 'Admin', await hashPassword(password)]);
+  return `User admin dibuat: ${addr}`;
 }

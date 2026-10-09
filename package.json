@@ -18,6 +18,7 @@
     "test:engine": "node --env-file=.env --test scripts/e2e-engine.ts",
     "server": "node --env-file=.env apps/server/src/main.ts",
     "web": "npm run dev -w @aawb/web",
+    "deploy": "sg docker -c 'bash scripts/deploy.sh'",
     "build": "npm run build -w @aawb/web"
   },
   "devDependencies": {

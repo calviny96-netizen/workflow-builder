@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, fmtTime, STATUS_LABEL } from './api.ts';
 import { Editor } from './Editor.tsx';
 import { RunView } from './RunView.tsx';
+import { AccountSettings } from './AccountSettings.tsx';
 
 function useHash() {
   const [hash, setHash] = useState(window.location.hash || '#/');
@@ -60,6 +61,18 @@ function Login({ onDone }: { onDone: (user: any) => void }) {
 function WorkflowList({ user, onLogout }: { user: any; onLogout: () => void }) {
   const [items, setItems] = useState<any[] | null>(null);
   const [error, setError] = useState('');
+  const [filter, setFilter] = useState('active');
+  const [search, setSearch] = useState('');
+  const [busyId, setBusyId] = useState('');
+  const [deleting, setDeleting] = useState<any>(null);
+  const [confirmation, setConfirmation] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const manage = async (w: any, action: string) => {
+    setBusyId(w.id); setError('');
+    try { await api('POST', `/api/workflows/${w.id}/lifecycle`, { action }); await load(); }
+    catch (e: any) { setError([e.message, ...(e.issues ?? [])].join(' ')); }
+    finally { setBusyId(''); }
+  };
   const load = () =>
     api('GET', '/api/workflows')
       .then((r) => setItems(r.items))
@@ -80,6 +93,7 @@ function WorkflowList({ user, onLogout }: { user: any; onLogout: () => void }) {
         </span>
         <span className="spacer" />
         <span className="muted">{user.email}</span>
+        <a className="btn" href="#/settings">Pengaturan</a>
         <button className="btn" onClick={onLogout}>
           Keluar
         </button>
@@ -94,7 +108,14 @@ function WorkflowList({ user, onLogout }: { user: any; onLogout: () => void }) {
             + Workflow baru
           </button>
         </div>
-        {error && <div className="error">{error}</div>}
+        <div className="workflow-filters">
+          <label>Cari workflow<input value={search} onChange={e => setSearch(e.target.value)} placeholder="Nama atau company…" /></label>
+          <label>Status<select value={filter} onChange={e => setFilter(e.target.value)}>
+            <option value="active">Aktif (Draft & Published)</option><option value="draft">Draft</option>
+            <option value="published">Published</option><option value="archived">Arsip</option><option value="all">Semua</option>
+          </select></label>
+        </div>
+        {error && <div className="error" role="alert">{error}</div>}
         {items && items.length === 0 && (
           <div className="empty card">
             <b>Belum ada workflow</b>
@@ -105,8 +126,10 @@ function WorkflowList({ user, onLogout }: { user: any; onLogout: () => void }) {
           </div>
         )}
         <div className="wf-grid">
-          {items?.map((w) => (
-            <a key={w.id} className="card wf-card" href={`#/w/${w.id}`}>
+          {items?.filter(w => (filter === 'all' || (filter === 'active' ? w.status !== 'archived' : w.status === filter)) && `${w.name} ${w.company_name}`.toLowerCase().includes(search.toLowerCase())).map((w) => (
+            <article key={w.id} className="card wf-card">
+              <div className="wf-card-foot"><span className={`badge lifecycle-${w.status}`}>{w.status === 'published' ? 'Published' : w.status === 'archived' ? 'Arsip' : 'Draft'}</span></div>
+              <a className="wf-open" href={`#/w/${w.id}`}>
               <div className="wf-card-name">{w.name}</div>
               <div className="muted">{w.company_name || 'Company belum dipilih'}</div>
               <div className="wf-card-foot">
@@ -114,10 +137,37 @@ function WorkflowList({ user, onLogout }: { user: any; onLogout: () => void }) {
                 {w.last_run ? <span className={`badge st-${w.last_run.status}`}>{STATUS_LABEL[w.last_run.status] ?? w.last_run.status}</span> : <span className="muted">belum pernah jalan</span>}
               </div>
               <div className="muted small">diubah {fmtTime(w.updated_at)}</div>
-            </a>
+              </a>
+              <div className="wf-actions">
+                {w.status === 'archived' ? <>
+                  <button className="btn" disabled={!!busyId} onClick={() => manage(w, 'restore')}>Pulihkan</button>
+                  <button className="btn danger" disabled={!!busyId} onClick={() => { setDeleting(w); setConfirmation(''); setDeleteError(''); }}>Hapus permanen</button>
+                </> : <>
+                  <button className="btn" disabled={!!busyId} onClick={() => manage(w, w.status === 'published' ? 'unpublish' : 'publish')}>{w.status === 'published' ? 'Unpublish' : 'Publish'}</button>
+                  <button className="btn" disabled={!!busyId} onClick={() => manage(w, 'archive')}>Arsipkan</button>
+                </>}
+                {busyId === w.id && <span className="muted small">Menyimpan…</span>}
+              </div>
+            </article>
           ))}
         </div>
       </main>
+      {deleting && <div className="modal-back" onClick={() => !busyId && setDeleting(null)}>
+        <form className="card modal" role="dialog" aria-modal="true" aria-labelledby="delete-title" onClick={e => e.stopPropagation()} onSubmit={async e => {
+          e.preventDefault(); if (confirmation !== 'DELETE' || busyId) return;
+          setBusyId(deleting.id); setDeleteError('');
+          try { await api('DELETE', `/api/workflows/${deleting.id}`, { confirmation }); setDeleting(null); await load(); }
+          catch (err: any) { setDeleteError(err.message); }
+          finally { setBusyId(''); }
+        }}>
+          <h3 id="delete-title">Hapus permanen “{deleting.name}”?</h3>
+          <p className="muted">Workflow, seluruh riwayat run, rahasia node, dan file hasilnya akan dihapus. Tindakan ini tidak dapat dibatalkan.</p>
+          <label>Ketik DELETE untuk menghapus<input autoFocus autoComplete="off" spellCheck={false} value={confirmation} onChange={e => setConfirmation(e.target.value)} disabled={!!busyId} /></label>
+          {deleteError && <div className="error" role="alert">{deleteError}</div>}
+          <div className="wf-actions"><button type="button" className="btn" disabled={!!busyId} onClick={() => setDeleting(null)}>Batal</button>
+            <button className="btn danger" disabled={confirmation !== 'DELETE' || !!busyId}>{busyId ? 'Menghapus…' : 'Hapus permanen'}</button></div>
+        </form>
+      </div>}
       {creating && <NewWorkflow onClose={() => setCreating(false)} />}
     </div>
   );
@@ -230,6 +280,7 @@ export function App() {
 
   if (user === undefined) return <div className="center-page muted">Memuat…</div>;
   if (!user) return <Login onDone={setUser} />;
+  if (hash === '#/settings') return <AccountSettings user={user} onUpdated={setUser} />;
 
   const run = hash.match(/^#\/w\/([0-9a-f-]+)\/run\/([0-9a-f-]+)/);
   if (run) return <RunView key={run[2]} workflowId={run[1]} runId={run[2]} />;

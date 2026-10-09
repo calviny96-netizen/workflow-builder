@@ -17,14 +17,14 @@ export function loadMasterKey(file: string): Buffer {
   return key;
 }
 
-function encrypt(master: Buffer, text: string): string {
+export function encrypt(master: Buffer, text: string): string {
   const iv = randomBytes(12);
   const c = createCipheriv('aes-256-gcm', master, iv);
   const body = Buffer.concat([c.update(text, 'utf8'), c.final()]);
   return [iv, c.getAuthTag(), body].map((b) => b.toString('base64')).join('.');
 }
 
-function decrypt(master: Buffer, packed: string): string {
+export function decrypt(master: Buffer, packed: string): string {
   const [iv, tag, body] = packed.split('.').map((x) => Buffer.from(x, 'base64'));
   const d = createDecipheriv('aes-256-gcm', master, iv);
   d.setAuthTag(tag);
@@ -32,10 +32,10 @@ function decrypt(master: Buffer, packed: string): string {
 }
 
 // Field rahasia per jenis node.
-const SECRET_FIELDS: Record<string, string[]> = { aimerge: ['apiKey'] };
+const SECRET_FIELDS: Record<string, string[]> = { trigger: ['webhookToken'], aimerge: ['apiKey'], http: ['autobotApiKey'] };
 
 // Memindahkan nilai rahasia dari graf ke tabel terenkripsi. Mengembalikan graf yang aman dikirim ke browser.
-export async function stashSecrets(db: Db, master: Buffer, workflowId: string, graph: Graph): Promise<Graph> {
+export async function stashSecrets(db: Pick<Db, 'query'>, master: Buffer, workflowId: string, graph: Graph): Promise<Graph> {
   const keep: string[] = [];
   const nodes = [];
   for (const n of graph.nodes) {

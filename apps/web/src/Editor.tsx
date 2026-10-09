@@ -77,6 +77,9 @@ function CompanyPicker({ value, onPick }: { value: { id: number | null; name: st
 function EditorInner({ workflowId }: { workflowId: string }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<WfNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [workflowStatus, setWorkflowStatus] = useState('draft');
+  const [publishing, setPublishing] = useState(false);
+  const archived = workflowStatus === 'archived';
   const [name, setName] = useState('');
   const [company, setCompany] = useState<{ id: number | null; name: string }>({ id: null, name: '' });
   const [settings, setSettings] = useState<Record<string, any>>({});
@@ -112,6 +115,7 @@ function EditorInner({ workflowId }: { workflowId: string }) {
         setNodes(g.nodes);
         setEdges(g.edges);
         setName(w.name);
+        setWorkflowStatus(w.status);
         setCompany({ id: w.company_id, name: w.company_name });
         setSettings(w.settings ?? {});
         last.current = JSON.stringify(w.graph);
@@ -191,20 +195,24 @@ function EditorInner({ workflowId }: { workflowId: string }) {
   );
   const savedPayload = useRef('');
   const save = useCallback(async () => {
+    if (archived) return false;
     if (payload === savedPayload.current) return true;
     setSaveState('saving');
     try {
-      const res = await api('PUT', `/api/workflows/${workflowId}`, JSON.parse(payload));
+      const submitted = JSON.parse(payload);
+      const res = await api('PUT', `/api/workflows/${workflowId}`, submitted);
       savedPayload.current = payload;
+      setWorkflowStatus(res.status);
       // API key yang baru diisi sudah disimpan terenkripsi di server; buang dari browser dan tampilkan petunjuknya saja.
-      const hints = new Map<string, string>(res.graph.nodes.filter((n: any) => n.type === 'aimerge').map((n: any) => [n.id, n.config.apiKeyHint ?? '']));
-      setNodes((ns) =>
-        ns.map((n) =>
-          n.data.type === 'aimerge' && (n.data.config.apiKey || n.data.config.apiKeyHint !== hints.get(n.id))
-            ? { ...n, data: { ...n.data, config: { ...n.data.config, apiKey: '', apiKeyHint: hints.get(n.id) ?? '' } } }
-            : n,
-        ),
-      );
+      const submittedNodes = new Map<string, any>(submitted.graph.nodes.map((n: any) => [n.id, n.config]));
+      const safeNodes = new Map<string, any>(res.graph.nodes.map((n: any) => [n.id, n.config]));
+      setNodes(ns => ns.map(n => {
+        const field = ({aimerge:'apiKey',http:'autobotApiKey',trigger:'webhookToken'} as Record<string,string>)[n.data.type];
+        const hint = safeNodes.get(n.id)?.[`${field}Hint`] ?? '';
+        if (field && n.data.config[field] !== submittedNodes.get(n.id)?.[field]) return n;
+        return field && (n.data.config[field] || n.data.config[`${field}Hint`] !== hint)
+          ? {...n,data:{...n.data,config:{...n.data.config,[field]:'',[`${field}Hint`]:hint}}} : n;
+      }));
       setSaveState('saved');
       return true;
     } catch (e: any) {
@@ -212,10 +220,10 @@ function EditorInner({ workflowId }: { workflowId: string }) {
       setMessage(`Gagal menyimpan: ${e.message}`);
       return false;
     }
-  }, [payload, workflowId, setNodes]);
+  }, [payload, workflowId, setNodes, archived]);
 
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || archived) return;
     if (!savedPayload.current) {
       savedPayload.current = payload; // keadaan awal dari server
       return;
@@ -224,7 +232,7 @@ function EditorInner({ workflowId }: { workflowId: string }) {
     setSaveState('dirty');
     const t = setTimeout(save, 1200);
     return () => clearTimeout(t);
-  }, [payload, loaded, save]);
+  }, [payload, loaded, save, archived]);
 
   // --- interaksi kanvas
   const isValidConnection = useCallback(
@@ -287,6 +295,7 @@ function EditorInner({ workflowId }: { workflowId: string }) {
     (type: NodeType, position: { x: number; y: number }) => {
       if (type === 'trigger' && nodes.some((n) => n.data.type === 'trigger')) return setMessage('Workflow hanya boleh punya satu Trigger.');
       const config: Record<string, any> = structuredClone(NODE_SPECS[type].defaults);
+      if (type === 'http') { const id=new URLSearchParams(window.location.search).get('autobot_workflow_id'); if(id && /^[0-9a-f-]{36}$/i.test(id)) config.autobotWorkflowId=id; }
       if (type === 'aw' && catalog?.default_model) config.model = catalog.default_model;
       // Titik jatuh menjadi tengah node, bukan pojok kiri atasnya.
       const at = { x: Math.round(position.x - 65), y: Math.round(position.y - 50) };
@@ -382,9 +391,18 @@ function EditorInner({ workflowId }: { workflowId: string }) {
   const hasChunk = nodes.some((n) => n.data.type === 'chunk');
   const hasAw = nodes.some((n) => n.data.type === 'aw');
   // Tanggal hanya dipakai Proses AW dan Hasil Continuous bermode rentang tanggal.
-  const needsDates = hasAw || nodes.some((n) => n.data.type === 'continuous' && n.data.config.pick === 'range');
+  const needsDates = nodes.some(n => n.data.type === 'aw' && (!n.data.config.analysisPeriod || n.data.config.analysisPeriod.mode === 'run')) || nodes.some((n) => n.data.type === 'continuous' && n.data.config.pick === 'range');
   const staleMin = Number(syncNode?.data.config.staleMinutes ?? 30);
   const syncChoice = syncPolicy ?? (syncNode?.data.config.policy as 'skip' | 'always' | 'stale' | undefined) ?? 'stale';
+
+  if (archived) return <div className="page">
+    <header className="topbar"><a className="btn" href="#/">← Workflow</a><b>{name}</b><span className="badge lifecycle-archived">Arsip</span></header>
+    <main className="list-main"><h2>Workflow diarsipkan</h2><p className="muted">Konfigurasi dan hasil tetap tersimpan. Pulihkan dari menu Arsip pada daftar workflow untuk mengedit atau menjalankan kembali.</p>
+      <div className="card archived-summary"><b>{company.name} · {nodes.length} node</b>
+        <p>AW bersamaan: {settings.concurrency ?? 5} · Konfirmasi sebelum jalan: {settings.requireApproval !== false ? 'Ya' : 'Tidak'}</p>
+        {nodes.map(n => <div key={n.id}>{NODE_SPECS[n.data.type].label} · {n.id}</div>)}
+      </div><h3>Riwayat run</h3>{runs.map(r => <p key={r.id}><a href={`#/w/${workflowId}/run/${r.id}`}>{r.status} · {fmtTime(r.created_at)}</a></p>)}
+    </main></div>;
 
   return (
     <div className="page">
@@ -416,6 +434,17 @@ function EditorInner({ workflowId }: { workflowId: string }) {
           Konfirmasi sebelum jalan
         </label>
         <span className="spacer" />
+        <span className={`badge lifecycle-${workflowStatus}`}>{workflowStatus === 'published' ? 'Published' : 'Draft'}</span>
+        <button className="btn" disabled={publishing || !loaded} title="Perubahan pada workflow published akan menjadi Draft. Run manual tersedia pada Draft." onClick={async () => {
+          setPublishing(true);
+          try {
+            if (!await save()) return;
+            const w = await api('POST', `/api/workflows/${workflowId}/lifecycle`, { action: workflowStatus === 'published' && payload === savedPayload.current ? 'unpublish' : 'publish' });
+            setWorkflowStatus(w.status);
+            setMessage(w.status === 'published' ? 'Workflow berhasil dipublish. Perubahan berikutnya perlu dipublish ulang.' : 'Workflow menjadi Draft.');
+          } catch (e: any) { setMessage([e.message, ...(e.issues ?? [])].join(' ')); }
+          finally { setPublishing(false); }
+        }}>{publishing ? 'Menyimpan…' : workflowStatus === 'published' ? 'Unpublish' : 'Publish'}</button>
         <button className="btn help-btn" onClick={() => setHelp('top')} title="Panduan (tombol ?)">
           <span>?</span> Panduan
         </button>
@@ -550,6 +579,7 @@ function EditorInner({ workflowId }: { workflowId: string }) {
         <aside className="panel">
           {selected ? (
             <ConfigPanel
+              workflowId={workflowId}
               key={selected.id}
               type={selected.data.type}
               config={selected.data.config}
@@ -653,7 +683,7 @@ function EditorInner({ workflowId }: { workflowId: string }) {
                 </label>
               </div>
             ) : (
-              <p className="small">Tidak perlu tanggal: yang diambil adalah run terakhir tiap jadwal dan history yang sudah dipilih. Daftarnya ditampilkan dulu sebelum diambil.</p>
+              <p className="small">{hasAw ? 'Periode analisis mengikuti pengaturan setiap node Proses AW, dengan hari ini sebagai tanggal acuan.' : 'Tidak perlu tanggal: yang diambil adalah run terakhir tiap jadwal dan history yang sudah dipilih.'}</p>
             )}
             {hasSync && (
               <div className="choice-group">

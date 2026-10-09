@@ -1,10 +1,11 @@
 // Klien Google Sheets minimal lewat service account. Tanpa pustaka: JWT ditandatangani dengan node:crypto.
 
-import { createSign } from 'node:crypto';
+import { createPrivateKey, createSign } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 
 export interface SheetsClient {
   email: string;
+  authorize?(): Promise<void>;
   tabs(spreadsheetId: string): Promise<{ title: string; spreadsheet: string; tabs: { gid: number; title: string }[] }>;
   read(spreadsheetId: string, tab: string): Promise<string[][]>;
   append(spreadsheetId: string, tab: string, rows: string[][]): Promise<void>;
@@ -19,21 +20,35 @@ const range = (tab: string, a1 = '') => `'${tab.replace(/'/g, "''")}'${a1 ? '!' 
 
 export function createSheetsClient(keyFile: string, doFetch: typeof fetch = fetch): SheetsClient | null {
   if (!existsSync(keyFile)) return null;
-  const key = JSON.parse(readFileSync(keyFile, 'utf8'));
+  return sheetsFromCredentials(readFileSync(keyFile, 'utf8'), doFetch);
+}
+
+export function sheetsFromCredentials(json: string, doFetch: typeof fetch = fetch): SheetsClient {
+  let key: any;
+  try {
+    key = JSON.parse(json);
+    if (key.type !== 'service_account' || typeof key.client_email !== 'string' || !key.client_email.endsWith('.iam.gserviceaccount.com') || typeof key.private_key !== 'string') throw new Error();
+    if (createPrivateKey(key.private_key).asymmetricKeyType !== 'rsa') throw new Error();
+  } catch {
+    throw new GoogleError('File harus berupa JSON service account Google dengan client_email dan private_key RSA yang valid.');
+  }
+  // Endpoint tetap: token_uri dari file unggahan tidak boleh mengarahkan JWT ke host lain.
+  const tokenUrl = 'https://oauth2.googleapis.com/token';
   let token = { value: '', exp: 0 };
 
   async function accessToken(): Promise<string> {
     if (token.value && Date.now() < token.exp - 60_000) return token.value;
     const now = Math.floor(Date.now() / 1000);
-    const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: key.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets', aud: key.token_uri, iat: now, exp: now + 3600 })}`;
+    const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: key.client_email, scope: 'https://www.googleapis.com/auth/spreadsheets', aud: tokenUrl, iat: now, exp: now + 3600 })}`;
     const sig = createSign('RSA-SHA256').update(unsigned).sign(key.private_key).toString('base64url');
-    const res = await doFetch(key.token_uri, {
+    const res = await doFetch(tokenUrl, {
+      signal: AbortSignal.timeout(30_000),
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: `${unsigned}.${sig}` }),
     });
     const j: any = await res.json();
-    if (!j.access_token) throw new GoogleError(`Login Google gagal: ${j.error_description ?? j.error ?? res.status}`);
+    if (!res.ok || !j.access_token) throw new GoogleError(`Login Google gagal: ${j.error_description ?? j.error ?? res.status}`);
     token = { value: j.access_token, exp: Date.now() + (j.expires_in ?? 3600) * 1000 };
     return token.value;
   }
@@ -61,6 +76,7 @@ export function createSheetsClient(keyFile: string, doFetch: typeof fetch = fetc
 
   return {
     email: key.client_email,
+    async authorize() { await accessToken(); },
     async tabs(id) {
       const j = await call('GET', `${id}?fields=properties.title,sheets.properties(sheetId,title)`);
       return { title: j.properties?.title ?? '', spreadsheet: id, tabs: (j.sheets ?? []).map((s: any) => ({ gid: s.properties.sheetId, title: s.properties.title })) };

@@ -1,3 +1,6 @@
+import { executeCode, codeItems } from './code.ts';
+import { createScheduler } from './scheduler.ts';
+import { resolvePeriod, validDate, wibClock } from '../../../packages/nodes/src/calendar.ts';
 import cookie from '@fastify/cookie';
 import Fastify from 'fastify';
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -7,7 +10,7 @@ import type { AutoAuditClient } from '../../../packages/autoaudit/src/index.ts';
 import { fingerprint } from '../../../packages/engine/src/plan.ts';
 import { incoming, validateGraph } from '../../../packages/nodes/src/index.ts';
 import type { Graph } from '../../../packages/nodes/src/index.ts';
-import { COOKIE, login, logout, userFromToken } from './auth.ts';
+import { COOKIE, login, logout, updateAccount, userFromToken } from './auth.ts';
 import type { SessionUser } from './auth.ts';
 import type { Db } from './db.ts';
 import type { Executor } from './executor.ts';
@@ -17,20 +20,28 @@ import { parseSheetUrl } from '../../../packages/engine/src/sheetplan.ts';
 import { buildPlan, PlanError, resolvePrompt } from './planner.ts';
 import { openRouterModels, stepNodes } from './steps.ts';
 import { checkKey } from './steps-aimerge.ts';
+import {randomUUID,timingSafeEqual} from 'node:crypto';
+import {readSecret} from './secrets.ts';
 import { stashSecrets } from './secrets.ts';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createReadStream, existsSync } from 'node:fs';
 import type { Plan } from './planner.ts';
 
 export interface AppDeps {
   db: Db;
+  filesDir?: string;
   api: AutoAuditClient;
   executor: Executor;
   sheets?: SheetsClient | null;
+  google?: ReturnType<typeof import('./google-settings.ts').googleSettings>;
   gowaReady?: boolean;
   masterKey: Buffer;
   fetch?: typeof fetch;
   globalConcurrency: number;
   secureCookie: boolean;
+  publicHostname?: string;
 }
 
 const graphSchema = z.object({
@@ -93,7 +104,7 @@ export function buildApp(deps: AppDeps) {
     const body = z.object({ email: z.string().email(), password: z.string().min(1) }).parse(req.body);
     const session = await login(db, body.email, body.password);
     if (!session) return reply.code(401).send({ error: 'Email atau password salah.' });
-    reply.setCookie(COOKIE, session.token, { httpOnly: true, sameSite: 'lax', secure: deps.secureCookie, path: '/', maxAge: 7 * 86400 });
+    reply.setCookie(COOKIE, session.token, { httpOnly: true, sameSite: 'lax', secure: deps.secureCookie || (!!deps.publicHostname && req.headers.host?.split(':')[0] === deps.publicHostname), path: '/', maxAge: 7 * 86400 });
     return { user: session.user };
   });
 
@@ -114,6 +125,21 @@ export function buildApp(deps: AppDeps) {
 
   app.get('/api/health', async () => ({ ok: true }));
   app.get('/api/auth/me', async (req) => ({ user: me(req) }));
+  app.patch('/api/auth/account', async (req, reply) => {
+    const body = z.object({
+      email: z.string().trim().toLowerCase().email().max(254),
+      currentPassword: z.string().min(1).max(1024),
+      newPassword: z.string().min(8).max(128).optional(),
+    }).parse(req.body);
+    try {
+      const user = await updateAccount(db, me(req).id, req.cookies[COOKIE]!, body.email, body.currentPassword, body.newPassword);
+      if (!user) return reply.code(403).send({ error: 'Password saat ini salah.' });
+      return { user };
+    } catch (err: any) {
+      if (err?.code === '23505') return reply.code(409).send({ error: 'Email sudah digunakan oleh akun lain.' });
+      throw err;
+    }
+  });
 
   // --- Proxy AutoAudit untuk dropdown. Token tidak pernah sampai ke browser.
   const aaFail = (reply: FastifyReply, res: { status: number; body: any }) =>
@@ -141,6 +167,19 @@ export function buildApp(deps: AppDeps) {
       })),
       pagination: res.body.pagination,
     };
+  });
+
+  app.get('/api/aa/official-accounts', async (req, reply) => {
+    const q = z.object({ company_id: z.coerce.number().int().positive(), q: z.string().default('') }).parse(req.query);
+    const res = await api.listOfficialAccounts(q.company_id);
+    if (!res.ok) return aaFail(reply, res);
+    const words = q.q.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const items = (unwrap<any>(res.body)?.items ?? []).map((a: any) => ({
+      id: a.id, name: a.name || a.verified_name || `Official #${a.id}`,
+      phone_number: a.display_phone_number ?? '', status: a.local_status ?? '',
+      verified_name: a.verified_name ?? '', channel: 'whatsapp_official',
+    })).filter((a: any) => words.every((w) => `${a.id} ${a.name} ${a.phone_number} ${a.verified_name}`.toLowerCase().includes(w)));
+    return { items, pagination: { total: items.length } };
   });
 
   app.get('/api/aa/histories', async (req, reply) => {
@@ -213,6 +252,13 @@ export function buildApp(deps: AppDeps) {
     return checkKey(b.key.trim(), deps.fetch);
   });
 
+  app.get('/api/google/credentials', async () => deps.google?.status() ?? ({ configured: !!deps.sheets?.email, email: deps.sheets?.email ?? null, error: '' }));
+  app.post('/api/google/credentials', async (req, reply) => {
+    const body = z.object({ json: z.string().min(1).max(32_768) }).parse(req.body);
+    if (!deps.google) return reply.code(503).send({ error: 'Pengaturan Google belum tersedia.' });
+    return deps.google.configure(body.json);
+  });
+
   // --- Google Sheets: daftar tab untuk panel konfigurasi
   app.get('/api/google/tabs', async (req, reply) => {
     const q = z.object({ url: z.string().min(1) }).parse(req.query);
@@ -238,12 +284,40 @@ export function buildApp(deps: AppDeps) {
       }
     });
   }
-  app.get('/api/integrations', async () => ({ gowa: !!deps.gowaReady, sheets_email: deps.sheets?.email ?? null, merge: await mergeAvailable() }));
+  app.get('/api/integrations', async () => ({ gowa: !!deps.gowaReady, sheets_email: deps.sheets?.email || null, merge: await mergeAvailable() }));
+
+  const filesDir = deps.filesDir ?? fileURLToPath(new URL('../../../.data/files', import.meta.url));
+  let cleaning = false;
+  async function cleanupFiles() {
+    if (cleaning) return;
+    cleaning = true;
+    try {
+      for (const row of (await db.query('select run_id from file_cleanup')).rows) {
+        await rm(join(filesDir, uuid.parse(row.run_id)), { recursive: true, force: true });
+        await db.query('delete from file_cleanup where run_id=$1', [row.run_id]);
+      }
+    } catch (error) { console.error('[file cleanup]', error); }
+    finally { cleaning = false; }
+  }
+  let cleanupTimer: ReturnType<typeof setInterval>;
+  app.addHook('onReady', async () => {
+    await cleanupFiles();
+    cleanupTimer = setInterval(() => { void cleanupFiles(); }, 30_000);
+    cleanupTimer.unref();
+  });
+  app.addHook('onClose', async () => { clearInterval(cleanupTimer); });
+
+  async function activeRuns(client: Pick<Db, 'query'>, id: string) {
+    return (await client.query(`select 1 from runs r where workflow_id=$1 and
+      (r.status in ('planning','running','awaiting_chunk','awaiting_approval')
+       or exists (select 1 from units u where u.run_id=r.id and u.status in ('starting','running'))
+       or exists (select 1 from steps s where s.run_id=r.id and s.status='running')) limit 1`, [id])).rowCount;
+  }
 
   // --- Workflow
   app.get('/api/workflows', async () => {
     const r = await db.query(
-      `select w.id, w.name, w.company_id, w.company_name, w.updated_at, jsonb_array_length(w.graph->'nodes') as node_count,
+      `select w.id, w.name, w.company_id, w.company_name, w.updated_at, w.status, w.published_at, w.archived_at, jsonb_array_length(w.graph->'nodes') as node_count,
          (select row_to_json(x) from (select id, status, created_at from runs where workflow_id = w.id order by created_at desc limit 1) x) as last_run
        from workflows w order by w.updated_at desc`,
     );
@@ -254,14 +328,19 @@ export function buildApp(deps: AppDeps) {
     const b = workflowBody.parse(req.body);
     // Company wajib dipilih sebelum workflow dibuat; semua daftar di editor bergantung padanya.
     if (!b.company_id) return reply.code(400).send({ error: 'Pilih company dulu sebelum membuat workflow.' });
-    const r = await db.query(
-      'insert into workflows (name, company_id, company_name, graph, settings, created_by) values ($1,$2,$3,$4,$5,$6) returning *',
-      [b.name, b.company_id, b.company_name, JSON.stringify({ nodes: [], edges: [] }), JSON.stringify(b.settings), me(req).id],
-    );
-    // Rahasia di node (API key) dipindah ke penyimpanan terenkripsi; graf yang disimpan hanya memuat petunjuknya.
-    const graph = await stashSecrets(db, deps.masterKey, r.rows[0].id, b.graph as Graph);
-    await db.query('update workflows set graph=$2 where id=$1', [r.rows[0].id, JSON.stringify(graph)]);
-    return { ...r.rows[0], graph };
+    const client = await db.connect();
+    try {
+      await client.query('begin');
+      const r = await client.query(
+        'insert into workflows (name, company_id, company_name, settings, created_by) values ($1,$2,$3,$4,$5) returning *',
+        [b.name, b.company_id, b.company_name, JSON.stringify(b.settings), me(req).id],
+      );
+      const graph = await stashSecrets(client, deps.masterKey, r.rows[0].id, b.graph as Graph);
+      await client.query('update workflows set graph=$2 where id=$1', [r.rows[0].id, JSON.stringify(graph)]);
+      await client.query('commit');
+      return { ...r.rows[0], graph };
+    } catch (error) { await client.query('rollback'); throw error; }
+    finally { client.release(); }
   });
 
   app.get('/api/workflows/:id', async (req, reply) => {
@@ -274,27 +353,78 @@ export function buildApp(deps: AppDeps) {
   app.put('/api/workflows/:id', async (req, reply) => {
     const id = uuid.parse((req.params as any).id);
     const b = workflowBody.parse(req.body);
-    if (!(await db.query('select 1 from workflows where id=$1', [id])).rows[0]) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
-    const safeGraph = await stashSecrets(db, deps.masterKey, id, b.graph as Graph);
-    // Company terkunci sejak workflow dibuat. Hanya workflow lama yang belum punya company yang boleh mengisinya.
-    const r = await db.query(
-      `update workflows set name=$2, company_id=coalesce(company_id, $3), company_name=case when company_id is null then $4 else company_name end,
+    const client = await db.connect();
+    try {
+      await client.query('begin');
+      const w = (await client.query('select * from workflows where id=$1 for update', [id])).rows[0];
+      if (!w) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
+      if (w.status === 'archived') return reply.code(409).send({ error: 'Pulihkan workflow dari arsip sebelum mengubahnya.' });
+      const safeGraph = await stashSecrets(client, deps.masterKey, id, b.graph as Graph);
+      const r = await client.query(
+        `update workflows set name=$2, company_id=coalesce(company_id, $3),
+         company_name=case when company_id is null then $4 else company_name end,
+         status=case when $7::boolean or name is distinct from $2 or graph is distinct from $5::jsonb or settings is distinct from $6::jsonb then 'draft' else status end,
          graph=$5, settings=$6, updated_at=now() where id=$1 returning *`,
-      [id, b.name, b.company_id, b.company_name, JSON.stringify(safeGraph), JSON.stringify(b.settings)],
-    );
-    if (!r.rows[0]) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
-    return { ...r.rows[0], issues: validateGraph(safeGraph) };
+        [id, b.name, b.company_id, b.company_name, JSON.stringify(safeGraph), JSON.stringify({...w.settings,...b.settings}), b.graph.nodes.some(n => ['apiKey','autobotApiKey','webhookToken'].some(field => String(n.config[field] ?? '').trim()))],
+      );
+      await client.query('commit');
+      return { ...r.rows[0], issues: validateGraph(safeGraph) };
+    } catch (error) { await client.query('rollback'); throw error; }
+    finally { await client.query('rollback'); client.release(); }
+  });
+
+  app.post('/api/workflows/:id/lifecycle', async (req, reply) => {
+    const id = uuid.parse((req.params as any).id);
+    const { action } = z.object({ action: z.enum(['publish','unpublish','archive','restore']) }).parse(req.body);
+    const client = await db.connect();
+    try {
+      await client.query('begin');
+      const w = (await client.query('select * from workflows where id=$1 for update', [id])).rows[0];
+      if (!w) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
+      if (action === 'restore') {
+        if (w.status !== 'archived') return reply.code(409).send({ error: 'Workflow belum diarsipkan.' });
+      } else if (w.status === 'archived') return reply.code(409).send({ error: 'Pulihkan workflow dari arsip terlebih dahulu.' });
+      if (action === 'publish') {
+        const issues = validateGraph(w.graph);
+        if (!w.company_id || issues.length) return reply.code(400).send({ error: 'Lengkapi workflow sebelum publish.', issues: issues.map(i => i.message) });
+      }
+      if (action === 'archive' && await activeRuns(client, id)) return reply.code(409).send({ error: 'Masih ada run aktif atau menunggu persetujuan. Batalkan dulu sebelum mengarsipkan.' });
+      const status = action === 'publish' ? 'published' : action === 'archive' ? 'archived' : 'draft';
+      const r = await client.query(`update workflows set status=$2, updated_at=now(),
+        published_at=case when $2='published' then now() else published_at end,
+        archived_at=case when $2='archived' then now() else null end where id=$1 returning *`, [id, status]);
+      await client.query('commit');
+      return r.rows[0];
+    } catch (error) { await client.query('rollback'); throw error; }
+    finally { await client.query('rollback'); client.release(); }
   });
 
   app.delete('/api/workflows/:id', async (req, reply) => {
     const id = uuid.parse((req.params as any).id);
-    const active = await db.query(`select 1 from runs where workflow_id=$1 and status in ('planning','running') limit 1`, [id]);
-    if (active.rows[0]) return reply.code(409).send({ error: 'Masih ada run yang berjalan. Batalkan dulu.' });
-    await db.query('delete from workflows where id=$1', [id]);
-    return { ok: true };
+    z.object({ confirmation: z.literal('DELETE') }).parse(req.body);
+    const client = await db.connect();
+    try {
+      await client.query('begin');
+      const w = (await client.query('select status from workflows where id=$1 for update', [id])).rows[0];
+      if (!w) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
+      if (w.status !== 'archived') return reply.code(409).send({ error: 'Arsipkan workflow sebelum menghapus permanen.' });
+      if (await activeRuns(client, id)) return reply.code(409).send({ error: 'Masih ada run aktif. Batalkan dulu.' });
+      await client.query(`insert into file_cleanup(run_id) select id from runs where workflow_id=$1 on conflict do nothing`, [id]);
+      await client.query('delete from workflows where id=$1', [id]);
+      await client.query('commit');
+      await cleanupFiles();
+      return { ok: true };
+    } catch (error) { await client.query('rollback'); throw error; }
+    finally { await client.query('rollback'); client.release(); }
   });
 
   // --- Run
+  app.addHook('preHandler', async (req, reply) => {
+    if (req.method !== 'POST' || !/^\/api\/runs\/[^/]+\/(approve|resume|replan|rechunk)/.test(req.url)) return;
+    const id = uuid.parse((req.params as any).id);
+    const row = (await db.query('select w.status from runs r join workflows w on w.id=r.workflow_id where r.id=$1', [id])).rows[0];
+    if (row?.status === 'archived') return reply.code(409).send({ error: 'Pulihkan workflow dari arsip sebelum melanjutkan run.' });
+  });
   async function planRun(runId: string, opts: { interactive: boolean } = { interactive: true }) {
     const r = await db.query('select * from runs where id=$1', [runId]);
     const run = r.rows[0];
@@ -356,6 +486,19 @@ export function buildApp(deps: AppDeps) {
     }
   }
 
+  const scheduler = createScheduler(db, async (id, requireApproval) => {
+    const status = (await db.query('select status from runs where id=$1', [id])).rows[0]?.status;
+    if (status === 'planning') await planRun(id, { interactive: false });
+    if (!requireApproval) await approve(id);
+  }, deps.globalConcurrency);
+  app.addHook('onReady', async () => { scheduler.start(); });
+  app.addHook('onClose', async () => { scheduler.stop(); });
+
+  app.post('/api/code/test', async (req) => {
+    const body = z.object({language:z.enum(['javascript','python']),code:z.string().min(1).max(100000),runMode:z.enum(['all','each']).default('all'),timeoutSeconds:z.number().int().min(1).max(30).default(10),items:z.any().default([])}).parse(req.body);
+    try {return await executeCode(body,body.items);} catch(error) {throw new PlanError([error instanceof Error ? error.message : String(error)]);}
+  });
+
   app.get('/api/workflows/:id/runs', async (req) => {
     const id = uuid.parse((req.params as any).id);
     const r = await db.query(
@@ -370,23 +513,95 @@ export function buildApp(deps: AppDeps) {
 
   app.post('/api/workflows/:id/runs', async (req, reply) => {
     const id = uuid.parse((req.params as any).id);
-    const b = z.object({ start_date: date, end_date: date, sync_policy: z.enum(['skip', 'always', 'stale']).optional() }).parse(req.body);
-    const w = (await db.query('select * from workflows where id=$1', [id])).rows[0];
-    if (!w) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
-    if (!w.company_id) return reply.code(400).send({ error: 'Pilih company dulu.' });
-    const issues = validateGraph(w.graph);
-    if (issues.length) return reply.code(400).send({ error: 'Workflow belum lengkap.', issues: issues.map((i) => i.message) });
-    const concurrency = Math.min(deps.globalConcurrency, Number(w.settings?.concurrency) || deps.globalConcurrency);
-    const r = await db.query(
-      `insert into runs (workflow_id, company_id, graph, params, concurrency, created_by) values ($1,$2,$3,$4,$5,$6) returning id`,
-      [id, w.company_id, JSON.stringify(w.graph), JSON.stringify(b), concurrency, me(req).id],
-    );
-    const runId = r.rows[0].id;
-    const requireApproval = w.settings?.requireApproval !== false;
+    const b = z.object({ start_date: date, end_date: date, sync_policy: z.enum(['skip', 'always', 'stale']).optional(), mode: z.enum(['manual', 'published']).default('manual') }).parse(req.body);
+    const client = await db.connect();
+    let runId: string;
+    let requireApproval: boolean;
+    try {
+      await client.query('begin');
+      const w = (await client.query('select * from workflows where id=$1 for update', [id])).rows[0];
+      if (!w) return reply.code(404).send({ error: 'Workflow tidak ditemukan.' });
+      if (w.status === 'archived') return reply.code(409).send({ error: 'Pulihkan workflow dari arsip sebelum menjalankan.' });
+      if (b.mode === 'published' && w.status !== 'published') return reply.code(409).send({ error: 'Workflow harus dipublish sebelum dijalankan oleh integrasi.' });
+      if (!w.company_id) return reply.code(400).send({ error: 'Pilih company dulu.' });
+      const issues = validateGraph(w.graph);
+      if (issues.length) return reply.code(400).send({ error: 'Workflow belum lengkap.', issues: issues.map((i) => i.message) });
+      const concurrency = Math.min(deps.globalConcurrency, Number(w.settings?.concurrency) || deps.globalConcurrency);
+      const r = await client.query(
+        `insert into runs (workflow_id, company_id, graph, params, concurrency, created_by) values ($1,$2,$3,$4,$5,$6) returning id`,
+        [id, w.company_id, JSON.stringify(w.graph), JSON.stringify({...b, analysis_date:wibClock().date}), concurrency, me(req).id],
+      );
+      runId = r.rows[0].id;
+      requireApproval = w.settings?.requireApproval !== false;
+      await client.query('commit');
+    } catch (error) { await client.query('rollback'); throw error; }
+    finally { await client.query('rollback'); client.release(); }
     planRun(runId, { interactive: requireApproval }).then(async () => {
       if (!requireApproval) await approve(runId);
     });
     return { id: runId };
+  });
+
+  // Workflow-scoped webhook credential; edits and publication serialize with run creation.
+  app.post('/integration/v1/workflows/:id/webhook', async (req, reply) => {
+    const id = uuid.parse((req.params as any).id);
+    const client = await db.connect();
+    let runId: string;
+    let requireApproval: boolean;
+    try {
+      await client.query('begin');
+      const w = (await client.query('select * from workflows where id=$1 for update',[id])).rows[0];
+      const start = w?.graph.nodes.find((n: any)=>n.type==='trigger' && n.config.mode==='webhook');
+      const bearer = String(req.headers.authorization ?? '').replace(/^Bearer /,'');
+      const token = start && w.status==='published' ? await readSecret(client as any,deps.masterKey,id,start.id,'webhookToken') : null;
+      if (!token || Buffer.byteLength(token)!==Buffer.byteLength(bearer) || !timingSafeEqual(Buffer.from(token),Buffer.from(bearer))) return reply.code(401).send({error:'Webhook tidak aktif atau token tidak valid.'});
+      const body = z.object({start_date:date.optional(),end_date:date.optional(),request_id:z.string().trim().min(1).max(200).optional(),items:z.any().optional(),data:z.any().optional()}).parse(req.body ?? {});
+      if (!!body.start_date !== !!body.end_date || (body.start_date && (!validDate(body.start_date) || !validDate(body.end_date) || body.end_date! < body.start_date))) return reply.code(400).send({error:'Isi kedua tanggal yang valid, dengan tanggal selesai sama atau setelah tanggal mulai.'});
+      if (!w.company_id) return reply.code(400).send({error:'Pilih company dulu.'});
+      const issues = validateGraph(w.graph);
+      if (issues.length) return reply.code(400).send({error:'Workflow belum lengkap.',issues:issues.map(i=>i.message)});
+      const key = `webhook:${body.request_id ?? randomUUID()}`;
+      const prior = (await client.query("select id from runs where workflow_id=$1 and params->>'schedule_key'=$2",[id,key])).rows[0];
+      if (prior) return {id:prior.id,duplicate:true};
+      const today = wibClock().date;
+      const range = body.start_date ? {start_date:body.start_date,end_date:body.end_date!} : resolvePeriod(start.config.triggerPeriod ?? {mode:'yesterday'},today,{start_date:today,end_date:today});
+      requireApproval = w.settings?.requireApproval !== false;
+      const params = {...range,...(body.items!==undefined || body.data!==undefined ? {items:codeItems(body.items ?? body.data)} : {}),analysis_date:today,trigger_source:'webhook',schedule_key:key,require_approval:requireApproval};
+      const r = await client.query('insert into runs(workflow_id,company_id,graph,params,concurrency,created_by,chunk_confirmed) values($1,$2,$3,$4,$5,$6,true) returning id',[id,w.company_id,w.graph,params,Math.min(deps.globalConcurrency,Number(w.settings?.concurrency)||deps.globalConcurrency),w.created_by]);
+      runId = r.rows[0].id;
+      await client.query('commit');
+    } catch(error) {await client.query('rollback');throw error;}
+    finally {await client.query('rollback');client.release();}
+    // The scheduler owns dispatch and restart recovery, with an advisory lock per run.
+    void scheduler.tick();
+    return reply.code(202).send({id:runId});
+  });
+
+  // Narrow integration: the existing Autobot HTTP-node key can trigger only this enabled workflow.
+  app.post('/integration/v1/workflows/:id/run', async (req, reply) => {
+    const id=uuid.parse((req.params as any).id);
+    const w=(await db.query('select * from workflows where id=$1',[id])).rows[0];
+    const bearer=String(req.headers.authorization||'').replace(/^Bearer /,'');
+    let authorized=false;
+    if(w?.settings?.autobotTriggerEnabled&&w.status==='published')for(const node of w.graph.nodes){
+      if(node.type!=='http'||node.config.destination!=='autobot')continue;
+      const key=await readSecret(db,deps.masterKey,id,node.id,'autobotApiKey');
+      if(key&&Buffer.byteLength(key)===Buffer.byteLength(bearer)&&timingSafeEqual(Buffer.from(key),Buffer.from(bearer))&&node.config.autobotWorkflowId===(req.body as any)?.workflow_id)authorized=true;
+    }
+    if(!authorized)return reply.code(401).send({error:'Credential workflow tidak valid.'});
+    const b=z.object({run_id:z.string().uuid(),period:z.object({from:date,to:date})}).parse(req.body);
+    if(b.period.from>b.period.to||[b.period.from,b.period.to].some(d=>!Number.isFinite(Date.parse(d))||new Date(d).toISOString().slice(0,10)!==d))return reply.code(400).send({error:'Periode tidak valid.'});
+    const client=await db.connect();let runId:string;let requireApproval=false;
+    try{
+      await client.query('begin');const current=(await client.query('select * from workflows where id=$1 for update',[id])).rows[0];
+      if(current.status!=='published'||!current.settings.autobotTriggerEnabled)return reply.code(409).send({error:'Workflow tidak aktif.'});
+      const prior=(await client.query("select id from runs where workflow_id=$1 and params->>'autobot_dispatch_id'=$2",[id,b.run_id])).rows[0];
+      if(prior)return {id:prior.id,duplicate:true};
+      const issues=validateGraph(current.graph);if(issues.length)return reply.code(400).send({error:'Workflow belum lengkap.',issues});
+      const r=await client.query('insert into runs(workflow_id,company_id,graph,params,concurrency,created_by) values($1,$2,$3,$4,$5,$6) returning id',[id,current.company_id,current.graph,{start_date:b.period.from,end_date:b.period.to,mode:'published',analysis_date:wibClock().date,autobot_dispatch_id:b.run_id},Math.min(deps.globalConcurrency,Number(current.settings.concurrency)||deps.globalConcurrency),current.created_by]);
+      runId=r.rows[0].id;requireApproval=current.settings.requireApproval!==false;await client.query('commit');
+    }catch(e){await client.query('rollback');throw e;}finally{await client.query('rollback');client.release();}
+    planRun(runId,{interactive:requireApproval}).then(async()=>{if(!requireApproval)await approve(runId);}).catch(e=>console.error('[autobot trigger]',e.message));return {id:runId};
   });
 
   app.get('/api/runs/:id', async (req, reply) => {
@@ -407,8 +622,9 @@ export function buildApp(deps: AppDeps) {
     const id = uuid.parse((req.params as any).id);
     const b = z.object({ overrides: overridesSchema }).parse(req.body);
     const r = await db.query(
-      `update runs set status='planning', overrides=$2, plan=null, error=null, finished_at=null, chunk_confirmed=true
-       where id=$1 and status in ('awaiting_chunk','awaiting_approval','plan_failed') returning id`,
+      `with allowed as (select id from workflows where id=(select workflow_id from runs where id=$1) and status <> 'archived' for update)
+       update runs set status='planning', overrides=$2, plan=null, error=null, finished_at=null, chunk_confirmed=true
+       where id=$1 and exists(select 1 from allowed) and status in ('awaiting_chunk','awaiting_approval','plan_failed') returning id`,
       [id, JSON.stringify(b.overrides)],
     );
     if (!r.rows[0]) return reply.code(409).send({ error: 'Rencana hanya bisa dihitung ulang sebelum run disetujui.' });
@@ -420,8 +636,9 @@ export function buildApp(deps: AppDeps) {
   app.post('/api/runs/:id/rechunk', async (req, reply) => {
     const id = uuid.parse((req.params as any).id);
     const r = await db.query(
-      `update runs set status='awaiting_chunk', chunk_confirmed=false, plan=null, error=null
-       where id=$1 and status in ('awaiting_approval','plan_failed') and preview is not null returning id`,
+      `with allowed as (select id from workflows where id=(select workflow_id from runs where id=$1) and status <> 'archived' for update)
+       update runs set status='awaiting_chunk', chunk_confirmed=false, plan=null, error=null
+       where id=$1 and exists(select 1 from allowed) and status in ('awaiting_approval','plan_failed') and preview is not null returning id`,
       [id],
     );
     if (!r.rows[0]) return reply.code(409).send({ error: 'Ukuran chunk hanya bisa diubah sebelum run disetujui.' });
@@ -445,51 +662,60 @@ export function buildApp(deps: AppDeps) {
   // Lanjutkan dari yang gagal: hanya bila prompt (isinya) dan filter masih sama dengan saat run dimulai.
   app.post('/api/runs/:id/resume', async (req, reply) => {
     const id = uuid.parse((req.params as any).id);
-    const run = (await db.query('select * from runs where id=$1', [id])).rows[0];
-    if (!run) return reply.code(404).send({ error: 'Run tidak ditemukan.' });
-    if (run.status !== 'failed') return reply.code(409).send({ error: 'Hanya run yang gagal yang bisa dilanjutkan.' });
+    const client = await db.connect();
+    try {
+      await client.query('begin');
+      const w = (await client.query(`select status from workflows where id=(select workflow_id from runs where id=$1) for update`, [id])).rows[0];
+      if (w?.status === 'archived') return reply.code(409).send({ error: 'Pulihkan workflow dari arsip sebelum melanjutkan run.' });
+      const run = (await client.query('select * from runs where id=$1', [id])).rows[0];
+      if (!run) return reply.code(404).send({ error: 'Run tidak ditemukan.' });
+      if (run.status !== 'failed') return reply.code(409).send({ error: 'Hanya run yang gagal yang bisa dilanjutkan.' });
 
-    const graph: Graph = run.graph;
-    const pending = (await db.query(`select * from units where run_id=$1 and status in ('failed','queued')`, [id])).rows;
-    const promptText = new Map<string, string>();
-    const changed: string[] = [];
-    for (const u of pending) {
-      if (u.payload?.fetch) continue; // unit yang hanya mengambil history tidak punya prompt
-      if (!promptText.has(u.node_id)) {
-        const promptNode = graph.nodes.find((n) => n.id === incoming(graph, u.node_id, 'prompt')[0]?.source);
-        if (!promptNode) return reply.code(409).send({ error: 'Node prompt tidak ditemukan di graf run ini.' });
-        promptText.set(u.node_id, (await resolvePrompt(api, run.company_id, promptNode)).text);
+      const graph: Graph = run.graph;
+      const pending = (await client.query(`select * from units where run_id=$1 and status in ('failed','queued')`, [id])).rows;
+      const promptText = new Map<string, string>();
+      const changed: string[] = [];
+      for (const u of pending) {
+        if (u.payload?.fetch) continue; // unit yang hanya mengambil history tidak punya prompt
+        if (!promptText.has(u.node_id)) {
+          const promptNode = graph.nodes.find((n) => n.id === incoming(graph, u.node_id, 'prompt')[0]?.source);
+          if (!promptNode) return reply.code(409).send({ error: 'Node prompt tidak ditemukan di graf run ini.' });
+          promptText.set(u.node_id, (await resolvePrompt(api, run.company_id, promptNode)).text);
+        }
+        const now = fingerprint({ ...u.fp_input, promptText: promptText.get(u.node_id)! });
+        if (now !== u.fingerprint) changed.push(u.label);
       }
-      const now = fingerprint({ ...u.fp_input, promptText: promptText.get(u.node_id)! });
-      if (now !== u.fingerprint) changed.push(u.label);
-    }
-    if (changed.length) {
-      return reply.code(409).send({
-        error: `Tidak bisa dilanjutkan: isi prompt berubah sejak run dimulai (${changed.length} Audital Work terdampak, mis. ${changed[0]}). Buat run baru.`,
-      });
-    }
+      if (changed.length) {
+        return reply.code(409).send({
+          error: `Tidak bisa dilanjutkan: isi prompt berubah sejak run dimulai (${changed.length} Audital Work terdampak, mis. ${changed[0]}). Buat run baru.`,
+        });
+      }
 
-    await db.query(
-      `update units set status='queued', error=null, history_id=null, correlation_id=null, unknown_count=0, started_at=null, finished_at=null,
-         attempt = attempt + 1 where run_id=$1 and status='failed'`,
-      [id],
-    );
-    // Sync yang gagal: hanya sales yang gagal yang diulang; yang sudah selesai tidak disinkron lagi.
-    const syncs = await db.query(`select id, output from steps where run_id=$1 and type='sync' and status='failed'`, [id]);
-    for (const s of syncs.rows) {
-      const jobs = (s.output?.jobs ?? []).map((j: any) => (j.status === 'failed' ? { sales_id: j.sales_id, name: j.name, status: 'pending' } : j));
-      await db.query(`update steps set status='waiting', error=null, finished_at=null, output=$2 where id=$1`, [s.id, JSON.stringify({ ...s.output, jobs, next_check: 0 })]);
-    }
-    // Merge yang gagal: bagian yang sudah selesai dipertahankan (sudah memakai token); hanya yang gagal diulang.
-    const merges = await db.query(`select id, output from steps where run_id=$1 and type='merge' and status='failed'`, [id]);
-    for (const s of merges.rows) {
-      const groups = (s.output?.groups ?? []).map((g: any) => (g.status === 'failed' ? { sources: g.sources, status: 'pending' } : g));
-      await db.query(`update steps set status='waiting', error=null, finished_at=null, output=$2 where id=$1`, [s.id, groups.length ? JSON.stringify({ ...s.output, groups, next_check: 0 }) : null]);
-    }
-    await db.query(`update steps set status='waiting', error=null, output=null, started_at=null, finished_at=null where run_id=$1 and status='failed'`, [id]);
-    await db.query(`update runs set status='running', halted=false, error=null, finished_at=null where id=$1`, [id]);
-    executor.tick();
-    return { ok: true, retried: pending.filter((u) => u.status === 'failed').length };
+      await client.query(
+        `update units set status='queued', error=null, history_id=null, correlation_id=null, unknown_count=0, started_at=null, finished_at=null,
+           attempt = attempt + 1 where run_id=$1 and status='failed'`,
+        [id],
+      );
+      // Sync yang gagal: hanya sales yang gagal yang diulang; yang sudah selesai tidak disinkron lagi.
+      const syncs = await client.query(`select id, output from steps where run_id=$1 and type='sync' and status='failed'`, [id]);
+      for (const s of syncs.rows) {
+        const jobs = (s.output?.jobs ?? []).map((j: any) => (j.status === 'failed' ? { sales_id: j.sales_id, name: j.name, status: 'pending' } : j));
+        await client.query(`update steps set status='waiting', error=null, finished_at=null, output=$2 where id=$1`, [s.id, JSON.stringify({ ...s.output, jobs, next_check: 0 })]);
+      }
+      // Merge yang gagal: bagian yang sudah selesai dipertahankan (sudah memakai token); hanya yang gagal diulang.
+      const merges = await client.query(`select id, output from steps where run_id=$1 and type='merge' and status='failed'`, [id]);
+      for (const s of merges.rows) {
+        const groups = (s.output?.groups ?? []).map((g: any) => (g.status === 'failed' ? { sources: g.sources, status: 'pending' } : g));
+        await client.query(`update steps set status='waiting', error=null, finished_at=null, output=$2 where id=$1`, [s.id, groups.length ? JSON.stringify({ ...s.output, groups, next_check: 0 }) : null]);
+      }
+      await client.query(`update steps set status='waiting', error=null, output=null, started_at=null, finished_at=null where run_id=$1 and status='failed'`, [id]);
+      await client.query(`update runs set status='running', halted=false, error=null, finished_at=null where id=$1`, [id]);
+      await client.query('commit');
+      executor.tick();
+      return { ok: true, retried: pending.filter((u) => u.status === 'failed').length };
+    } catch (error) { await client.query('rollback'); throw error; }
+    finally { await client.query('rollback'); client.release(); }
+
   });
 
   app.get('/api/units/:id', async (req, reply) => {
@@ -506,7 +732,7 @@ export function buildApp(deps: AppDeps) {
     const s = r.rows[0];
     if (!s) return reply.code(404).send({ error: 'Langkah tidak ditemukan.' });
     const tables = (s.output?.tables ?? []).map((t: any) => ({ columns: t.columns, rows: t.rows.slice(0, 100), total: t.rows.length }));
-    return { id: s.id, node_id: s.node_id, type: s.type, status: s.status, error: s.error, summary: s.output?.summary ?? null, tables, report: s.output?.report ?? null };
+    return { id: s.id, node_id: s.node_id, type: s.type, status: s.status, error: s.error, summary: s.output?.summary ?? null, tables, report: s.output?.report ?? null, items: s.output?.items?.slice(0,100) ?? [], totalItems: s.output?.items?.length ?? 0, logs:s.output?.logs ?? [] };
   });
 
   const sendStepFile = async (id: string, reply: FastifyReply) => {

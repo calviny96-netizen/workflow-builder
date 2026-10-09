@@ -6,7 +6,7 @@ import { buildApp } from './app.ts';
 import { seedAdmin } from './auth.ts';
 import { createPool, migrate } from './db.ts';
 import { createExecutor } from './executor.ts';
-import { createSheetsClient } from './google.ts';
+import { googleSettings } from './google-settings.ts';
 import { gowaFromEnv } from './steps-io.ts';
 import { loadMasterKey } from './secrets.ts';
 
@@ -33,14 +33,19 @@ const seeded = await seedAdmin(db, process.env.ADMIN_EMAIL, process.env.ADMIN_PA
 if (seeded) console.log(seeded);
 
 const api = createClient({ baseUrl: need('AUTOAUDIT_BASE_URL'), token: need('AUTOAUDIT_API_KEY') });
-const sheets = createSheetsClient(fileURLToPath(new URL('../../../.secrets/google.json', import.meta.url)));
-console.log(sheets ? `Google Sheets siap sebagai ${sheets.email}` : 'Google Sheets belum dipasang (.secrets/google.json tidak ada).');
 
 const gowa = gowaFromEnv(process.env);
 console.log(gowa ? `GOWA siap di ${gowa.baseUrl}` : 'GOWA belum diatur (GOWA_BASE_URL, GOWA_USER, GOWA_PASSWORD di .env).');
 
 // Kunci untuk mengenkripsi rahasia yang diisi user di node (mis. API key OpenRouter).
 const masterKey = loadMasterKey(fileURLToPath(new URL('../../../.data/secret.key', import.meta.url)));
+
+const google = googleSettings(
+  fileURLToPath(new URL('../../../.data/google.enc', import.meta.url)), masterKey,
+  process.env.GOOGLE_APPLICATION_CREDENTIALS || fileURLToPath(new URL('../../../.secrets/google.json', import.meta.url)),
+);
+const sheets = google.sheets;
+console.log(google.status().configured ? 'Google Sheets siap.' : 'Google Sheets belum diatur; unggah kredensial pada node Tulis Sheets.');
 
 const executor = createExecutor({
   db,
@@ -55,7 +60,7 @@ const executor = createExecutor({
   log: (m) => console.log(`[mesin] ${m}`),
 });
 
-const app = buildApp({ db, api, executor, sheets, masterKey, gowaReady: !!gowa, globalConcurrency, secureCookie: process.env.NODE_ENV === 'production' });
+const app = buildApp({ db, api, executor, sheets, google, masterKey, gowaReady: !!gowa, globalConcurrency, publicHostname: process.env.PUBLIC_HOSTNAME, secureCookie: process.env.NODE_ENV === 'production' });
 
 // Build web (apps/web/dist) disajikan bila ada; saat pengembangan Vite yang menyajikannya.
 const dist = fileURLToPath(new URL('../../web/dist', import.meta.url));

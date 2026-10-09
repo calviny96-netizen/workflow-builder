@@ -4,12 +4,13 @@
 import { errorCode, unwrap } from '../../../packages/autoaudit/src/index.ts';
 import type { AuditFilter, AutoAuditClient, RunPayload } from '../../../packages/autoaudit/src/index.ts';
 import { daysBetween, fingerprint, recommendChunk, splitByContacts, splitByDays } from '../../../packages/engine/src/plan.ts';
-import { incoming, parsePhones, salesBehind, validateGraph } from '../../../packages/nodes/src/index.ts';
+import { incoming, parsePhones, salesBehind, validateGraph, resolvePeriod, wibClock } from '../../../packages/nodes/src/index.ts';
 import type { Graph, GraphNode } from '../../../packages/nodes/src/index.ts';
 
 export interface RunParams {
   start_date: string;
   end_date: string;
+  analysis_date?: string;
   sync_policy?: 'skip' | 'always' | 'stale';
 }
 
@@ -39,6 +40,7 @@ export interface PlanGroup {
     recommended: { daysPerPart: number; contactsPerPart: number };
     full: Estimate;
   };
+  period?: { start_date: string; end_date: string; days: number };
   contacts?: { mode: 'only' | 'exclude'; count: number }; // filter nomor yang berlaku
   full?: Estimate; // estimasi periode penuh untuk sumber tanpa Chunk (hanya di tahap pratinjau)
   units: number;
@@ -141,6 +143,36 @@ async function allContacts(api: AutoAuditClient, salesId: number, filter: AuditF
   return [...(first.body?.data ?? []), ...rest.flat()];
 }
 
+async function allOfficialContacts(api: AutoAuditClient, companyId: number, accountId: number, filter: AuditFilter) {
+  const counts = new Map<string, number>();
+  const cursors = new Set<string>();
+  let cursor: string | null = null;
+  for (let page = 0; page < 1000; page++) {
+    const res = await api.listOfficialMessages(accountId, {
+      company_id: companyId,
+      filter: { start_date: filter.start_date, end_date: filter.end_date },
+      limit: 1000,
+      cursor,
+    });
+    if (!res.ok) throw new PlanError([`Gagal membaca kontak WhatsApp Official ${accountId} (${res.status} ${errorCode(res.body)}).`]);
+    const data = unwrap<any>(res.body);
+    if (!Array.isArray(data?.items)) throw new PlanError(['Respons pesan WhatsApp Official tidak valid.']);
+    for (const message of data.items) {
+      const phone = String(message.contact_wa_id ?? '');
+      if (phone) counts.set(phone, (counts.get(phone) ?? 0) + 1);
+    }
+    const next = data.next_cursor;
+    if (!next) {
+      if (data.truncated) throw new PlanError(['Halaman pesan WhatsApp Official terpotong tanpa cursor berikutnya. Persempit rentang tanggal.']);
+      return [...counts].map(([phone_number, message_count]) => ({ phone_number, message_count }));
+    }
+    if (typeof next !== 'string' || cursors.has(next)) throw new PlanError(['Cursor pesan WhatsApp Official tidak maju.']);
+    cursors.add(next);
+    cursor = next;
+  }
+  throw new PlanError(['Pembacaan kontak WhatsApp Official melebihi 1000 halaman. Persempit rentang tanggal.']);
+}
+
 interface PromptResolved {
   text: string; // isi prompt, dipakai untuk sidik jari
   payload: { prompt: string; saved_prompt_id?: number };
@@ -177,13 +209,15 @@ export async function buildPlan(input: {
 
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
   const totalDays = daysBetween(params.start_date, params.end_date);
-  const modelsRes = await api.listModels(companyId);
+  const modelsRes = graph.nodes.some(n=>n.type==='aw') ? await api.listModels(companyId) : {ok:true,body:{items:[]}};
   const modelNames = new Set<string>((unwrap<any>(modelsRes.body)?.items ?? []).map((m: any) => String(m.model_name)));
 
   const plan: Plan = { groups: [], units: [], warnings: [], totals: { units: 0, skipped: 0, contacts: 0, messages: 0, tokens: 0 }, days: totalDays, preview: input.previewOnly === true };
 
   for (const aw of graph.nodes.filter((n) => n.type === 'aw')) {
     const c = aw.config ?? {};
+    const period = resolvePeriod(c.analysisPeriod, params.analysis_date ?? wibClock().date, params);
+    const periodDays = daysBetween(period.start_date, period.end_date);
     // Preflight tidak memvalidasi nama model, jadi dicek di sini.
     if (modelsRes.ok && !modelNames.has(String(c.model))) throw new PlanError([`Model "${c.model}" tidak ada di daftar model AutoAudit.`]);
 
@@ -197,8 +231,8 @@ export async function buildPlan(input: {
     const runBySuperadmin = c.runBySuperadmin === true;
 
     const baseFilter: AuditFilter = {
-      start_date: params.start_date,
-      end_date: params.end_date,
+      start_date: period.start_date,
+      end_date: period.end_date,
       chat_type: c.chatType || 'individual',
       time_filter_mode: c.timeFilterMode || 'all_day',
       ...(c.timeFilterMode === 'daily_window' ? { start_time: c.startTime, end_time: c.endTime } : {}),
@@ -215,15 +249,22 @@ export async function buildPlan(input: {
       baseFilter.is_excluded = contactMode === 'exclude';
     }
 
-    const makePayload = (salesId: number, filter: AuditFilter): RunPayload => ({
+    const makePayload = (source: PlanGroup['source'], filter: AuditFilter): RunPayload => ({
       company_id: companyId,
-      sales_id: salesId,
+      ...(source.channel === 'whatsapp_official' ? { whatsapp_official_account_id: source.id } : { sales_id: source.id }),
       model: String(c.model),
       ...prompt.payload,
       run_by_superadmin: runBySuperadmin,
       selected_memory_ids: memoryIds,
       filter,
     });
+    const preflight = async (source: PlanGroup['source'], filter: AuditFilter) => {
+      const res = await api.preflight(makePayload(source, filter));
+      if (source.channel === 'whatsapp_official' && !res.ok && errorCode(res.body) !== 'empty_filter_result') {
+        throw new PlanError([`${source.name}: preflight WhatsApp Official ditolak (${res.status} ${errorCode(res.body)}).`]);
+      }
+      return res;
+    };
 
     // Kumpulkan sumber: langsung dari Sales, atau lewat Chunk.
     const inputs: { source: PlanGroup['source']; chunkNode: GraphNode | null }[] = [];
@@ -231,26 +272,29 @@ export async function buildPlan(input: {
       const from = byId.get(e.source)!;
       // Sales bisa datang langsung, lewat Sync Sales, lewat Chunk, atau keduanya.
       for (const s of salesBehind(graph, from.id)) {
-        inputs.push({ source: { channel: 'whatsapp', id: s.id, name: s.name }, chunkNode: from.type === 'chunk' ? from : null });
+        inputs.push({ source: { channel: s.channel, id: s.id, name: s.name }, chunkNode: from.type === 'chunk' ? from : null });
       }
     }
 
     const drafts: { group: PlanGroup; label: string; filter: AuditFilter }[] = [];
     for (const inp of inputs) {
-      const group: PlanGroup = { nodeId: aw.id, source: inp.source, chunk: null, units: 0, warnings: [], contacts: contactMode === 'all' ? undefined : { mode: contactMode, count: phones.length } };
+      if (inp.source.channel === 'whatsapp_official' && (baseFilter.chat_type !== 'individual' || baseFilter.include_full_history_mode !== 'none')) {
+        throw new PlanError([`${inp.source.name}: WhatsApp Official mendukung chat private dengan history pada rentang tanggal terpilih. Pilih "Hanya chat private" dan "Hanya rentang tanggal terpilih" pada Proses AW.`]);
+      }
+      const group: PlanGroup = { nodeId: aw.id, period: { ...period, days: periodDays }, source: inp.source, chunk: null, units: 0, warnings: [], contacts: contactMode === 'all' ? undefined : { mode: contactMode, count: phones.length } };
       plan.groups.push(group);
 
       if (!inp.chunkNode) {
-        if (input.previewOnly) group.full = readEstimate(await api.preflight(makePayload(inp.source.id, baseFilter)));
+        if (input.previewOnly) group.full = readEstimate(await preflight(inp.source, baseFilter));
         else drafts.push({ group, label: inp.source.name, filter: baseFilter });
         continue;
       }
 
       const cc = { ...inp.chunkNode.config, ...(overrides[inp.chunkNode.id] ?? {}) };
       const mode: 'days' | 'contacts' = cc.mode === 'contacts' ? 'contacts' : 'days';
-      const fullRes = await api.preflight(makePayload(inp.source.id, baseFilter));
+      const fullRes = await preflight(inp.source, baseFilter);
       const full = readEstimate(fullRes);
-      const recommended = recommendChunk(preflightNumbers(fullRes, totalDays));
+      const recommended = recommendChunk(preflightNumbers(fullRes, periodDays));
       const manual = cc.size !== null && cc.size !== undefined && Number(cc.size) >= 1;
       const size = manual ? Math.floor(Number(cc.size)) : mode === 'days' ? recommended.daysPerPart : recommended.contactsPerPart;
       group.chunk = { nodeId: inp.chunkNode.id, mode, size, sizeFrom: manual ? 'manual' : 'usulan', recommended, full };
@@ -264,7 +308,7 @@ export async function buildPlan(input: {
       }
       const maxParts = Math.max(1, Number(cc.maxParts) || 40);
       if (mode === 'days') {
-        const { slices, warnings } = splitByDays(params.start_date, params.end_date, size, maxParts);
+        const { slices, warnings } = splitByDays(period.start_date, period.end_date, size, maxParts);
         group.warnings.push(...warnings);
         for (const s of slices) {
           const label = s.start_date === s.end_date ? s.start_date : `${s.start_date} s/d ${s.end_date}`;
@@ -272,7 +316,9 @@ export async function buildPlan(input: {
         }
       } else {
         // Daftar kontak disaring dulu sesuai filter nomor, baru dibagi. Tiap bagian lalu membawa nomornya sendiri.
-        const everyone = await allContacts(api, inp.source.id, baseFilter);
+        const everyone = inp.source.channel === 'whatsapp_official'
+          ? await allOfficialContacts(api, companyId, inp.source.id, baseFilter)
+          : await allContacts(api, inp.source.id, baseFilter);
         const contacts =
           contactMode === 'all' ? everyone : everyone.filter((x: any) => phoneSet.has(String(x.phone_number)) === (contactMode === 'only'));
         const { slices, warnings } = splitByContacts(contacts, size, maxParts);
@@ -291,10 +337,10 @@ export async function buildPlan(input: {
       throw new PlanError([`Rencana menghasilkan ${plan.units.length + drafts.length} Audital Work, melebihi batas ${maxUnits}. Perbesar ukuran chunk.`]);
     }
 
-    const estimates = await pool(drafts, 4, async (d) => readEstimate(await api.preflight(makePayload(d.group.source.id, d.filter))));
+    const estimates = await pool(drafts, 4, async (d) => readEstimate(await preflight(d.group.source, d.filter)));
     drafts.forEach((d, i) => {
       const est = estimates[i];
-      const payload = makePayload(d.group.source.id, d.filter);
+      const payload = makePayload(d.group.source, d.filter);
       const fpInput = { model: payload.model, memoryIds, filter: d.filter, runBySuperadmin, source: { channel: d.group.source.channel, id: d.group.source.id } };
       const skip = est.errorCode === 'empty_filter_result' || (est.contacts === 0 && !est.canStart);
       if (!skip && !est.canStart) d.group.warnings.push(`${d.label}: preflight menolak (${est.errorCode || 'can_start=false'}).`);

@@ -1,6 +1,9 @@
+import { GoogleCredentials } from './GoogleCredentials.tsx';
+import { CodeConfig } from './CodeConfig.tsx';
+import { AnalysisCalendar } from './AnalysisCalendar.tsx';
 import { useEffect, useState } from 'react';
-import { DEFAULT_FILE_PATTERN, EXPORT_FORMATS, fileNameFrom, NODE_SPECS, parsePhones } from '@nodes';
-import type { NodeType } from '@nodes';
+import { DEFAULT_FILE_PATTERN, httpDestination, httpUrl, EXPORT_FORMATS, fileNameFrom, NODE_SPECS, parsePhones, salesSourceKey } from '@nodes';
+import type { NodeType, SalesChannel, SalesSource } from '@nodes';
 import { api } from './api.ts';
 import { NODE_HELP } from './help.ts';
 import { NodeIcon } from './HelpDrawer.tsx';
@@ -50,6 +53,7 @@ export interface Catalog {
 }
 
 interface Props {
+  workflowId: string;
   type: NodeType;
   config: Record<string, any>;
   companyId: number | null;
@@ -59,64 +63,79 @@ interface Props {
   onHelp: () => void;
 }
 
-function SalesPicker({ companyId, selected, onChange }: { companyId: number; selected: { id: number; name: string }[]; onChange: (v: { id: number; name: string }[]) => void }) {
+function SalesPicker({ companyId, selected, sourceType, onSourceType, onChange }: { companyId: number; selected: SalesSource[]; sourceType: SalesChannel; onSourceType: (type: SalesChannel) => void; onChange: (v: SalesSource[]) => void }) {
   const [q, setQ] = useState('');
   const [items, setItems] = useState<any[]>([]);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let live = true;
+    setItems([]);
+    setTotal(0);
+    setError('');
+    setLoading(true);
     const t = setTimeout(() => {
-      api('GET', `/api/aa/sales?company_id=${companyId}&q=${encodeURIComponent(q)}`)
+      api('GET', `/api/aa/${sourceType === 'whatsapp_official' ? 'official-accounts' : 'sales'}?company_id=${companyId}&q=${encodeURIComponent(q)}`)
         .then((r) => {
           if (!live) return;
-          setItems(r.items);
+          setItems(r.items.map((s: any) => ({ ...s, channel: sourceType })));
           setTotal(r.pagination?.total ?? r.items.length);
           setError('');
         })
-        .catch((e) => live && setError(e.message));
+        .catch((e) => live && setError(e.message))
+        .finally(() => live && setLoading(false));
     }, 250);
     return () => {
       live = false;
       clearTimeout(t);
     };
-  }, [companyId, q]);
+  }, [companyId, q, sourceType]);
 
-  const ids = new Set(selected.map((s) => s.id));
-  const toggle = (s: any) => onChange(ids.has(s.id) ? selected.filter((x) => x.id !== s.id) : [...selected, { id: s.id, name: s.name }]);
+  const ids = new Set(selected.map(salesSourceKey));
+  const toggle = (s: SalesSource) => onChange(ids.has(salesSourceKey(s)) ? selected.filter((x) => salesSourceKey(x) !== salesSourceKey(s)) : [...selected, { id: s.id, name: s.name, channel: s.channel }]);
 
   return (
     <>
+      <label>Jenis sumber
+        <Select value={sourceType} onChange={(e) => { setQ(''); onSourceType(e.target.value as SalesChannel); }}>
+          <option value="whatsapp">Sales ID</option>
+          <option value="whatsapp_official">WhatsApp Official</option>
+        </Select>
+      </label>
+      <p className="muted small">Pilihan dari kedua jenis sumber dapat digabung dalam satu node. Setiap sumber memakai ID dan datasetnya sendiri.</p>
+      {sourceType === 'whatsapp_official' && <div className="notice">Official membaca pesan teks private pada rentang tanggal terpilih. Pada Proses AW, gunakan Hanya chat private dan Hanya rentang tanggal terpilih.</div>}
       {selected.length > 0 && (
         <div className="chips">
           {selected.map((s) => (
-            <button key={s.id} className="chip" onClick={() => toggle(s)} title="Klik untuk melepas">
-              {s.name} ×
+            <button key={salesSourceKey(s)} className="chip" onClick={() => toggle(s)} title="Klik untuk melepas">
+              {s.name} · {s.channel === 'whatsapp_official' ? 'Official' : 'Sales'} #{s.id} ×
             </button>
           ))}
         </div>
       )}
-      <input placeholder="Cari nama atau nomor sales…" value={q} onChange={(e) => setQ(e.target.value)} />
+      <input placeholder={sourceType === 'whatsapp_official' ? 'Cari nama, ID, atau nomor akun Official…' : 'Cari nama atau nomor sales…'} value={q} onChange={(e) => setQ(e.target.value)} />
       {error && <div className="error">{error}</div>}
       <div className="pick-list">
         {items.map((s) => (
-          <label key={s.id} className="pick-row">
-            <input type="checkbox" checked={ids.has(s.id)} onChange={() => toggle(s)} />
+          <label key={salesSourceKey(s)} className="pick-row">
+            <input type="checkbox" checked={ids.has(salesSourceKey(s))} onChange={() => toggle(s)} />
             <span className="pick-main">
               {s.name}
               <span className="muted small">
-                {s.division ? `${s.division} · ` : ''}
+                #{s.id} · {s.phone_number ? `${s.phone_number} · ` : ''}{s.division ? `${s.division} · ` : ''}
                 {s.status}
               </span>
             </span>
           </label>
         ))}
-        {items.length === 0 && !error && <div className="muted small">Tidak ada sales yang cocok.</div>}
+        {loading && <div className="muted small">Memuat sumber…</div>}
+        {items.length === 0 && !error && !loading && <div className="muted small">{sourceType === 'whatsapp_official' ? 'Tidak ada akun WhatsApp Official yang cocok pada company ini.' : 'Tidak ada sales yang cocok.'}</div>}
       </div>
       {total > items.length && <div className="muted small">Menampilkan {items.length} dari {total}. Persempit dengan pencarian.</div>}
       <div className="row">
-        <button className="btn small" onClick={() => onChange([...selected, ...items.filter((s) => !ids.has(s.id)).map((s) => ({ id: s.id, name: s.name }))])}>
+        <button className="btn small" disabled={loading} onClick={() => onChange([...selected, ...items.filter((s) => !ids.has(salesSourceKey(s))).map((s) => ({ id: s.id, name: s.name, channel: s.channel }))])}>
           Pilih semua yang tampil
         </button>
         <button className="btn small" onClick={() => onChange([])}>
@@ -558,14 +577,15 @@ function SheetsConfig({ config, onChange }: { config: Record<string, any>; onCha
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  async function load(url: string, keepGid: boolean) {
+  async function load(url: string, keepGid: boolean, selectedGid = config.gid) {
     if (!/\/spreadsheets\/d\//.test(url)) return;
     setBusy(true);
     setError('');
     try {
-      const m = await api('GET', `/api/google/tabs?url=${encodeURIComponent(url)}`);
+      const lookup = keepGid && selectedGid != null ? `${url.split('#')[0].split('?')[0]}#gid=${selectedGid}` : url;
+      const m = await api('GET', `/api/google/tabs?url=${encodeURIComponent(lookup)}`);
       setMeta(m);
-      const gid = keepGid && m.tabs.some((t: any) => t.gid === config.gid) ? config.gid : (m.gid ?? m.tabs[0]?.gid ?? null);
+      const gid = keepGid && m.tabs.some((t: any) => t.gid === selectedGid) ? selectedGid : (m.gid ?? m.tabs[0]?.gid ?? null);
       onChange({ gid, tabTitle: m.tabs.find((t: any) => t.gid === gid)?.title ?? '' });
     } catch (e: any) {
       setMeta(null);
@@ -581,6 +601,7 @@ function SheetsConfig({ config, onChange }: { config: Record<string, any>; onCha
   const header: string[] | null = meta?.tabs.find((t: any) => t.gid === config.gid)?.header ?? null;
   return (
     <>
+      <GoogleCredentials onConfigured={() => { if (config.url) void load(config.url, true); }} />
       <label>
         Tautan spreadsheet
         <input value={config.url ?? ''} placeholder="https://docs.google.com/spreadsheets/d/…" onChange={(e) => onChange({ url: e.target.value })} onBlur={(e) => load(e.target.value, false)} />
@@ -598,7 +619,7 @@ function SheetsConfig({ config, onChange }: { config: Record<string, any>; onCha
               onChange={(e) => {
                 const gid = Number(e.target.value);
                 onChange({ gid, tabTitle: meta.tabs.find((t: any) => t.gid === gid)?.title ?? '' });
-                load(`${config.url.split('#')[0].split('?')[0]}#gid=${gid}`, true);
+                load(`${config.url.split('#')[0].split('?')[0]}#gid=${gid}`, true, gid);
               }}
             >
               {meta.tabs.map((t: any) => (
@@ -638,7 +659,9 @@ function SheetsConfig({ config, onChange }: { config: Record<string, any>; onCha
   );
 }
 
-export function ConfigPanel({ type, config, companyId, catalog, onChange, onDelete, onHelp }: Props) {
+export function ConfigPanel({ workflowId, type, config, companyId, catalog, onChange, onDelete, onHelp }: Props) {
+  const [newWebhookToken, setNewWebhookToken] = useState('');
+  const [tokenCopied, setTokenCopied] = useState(false);
   const spec = NODE_SPECS[type];
   const byId = new Map((useOpenRouterModels().models ?? []).map((m) => [m.id, m]));
   const needCompany = ['sales', 'prompt', 'memory', 'aw', 'history', 'continuous', 'merge'].includes(type) && !companyId;
@@ -667,7 +690,9 @@ export function ConfigPanel({ type, config, companyId, catalog, onChange, onDele
 
       {needCompany && <div className="notice">Pilih company di bilah atas dulu.</div>}
 
-      {type === 'sales' && companyId && <SalesPicker companyId={companyId} selected={config.sales ?? []} onChange={(sales) => onChange({ sales })} />}
+      {type === 'code' && <CodeConfig config={config} onChange={onChange}/> }
+
+      {type === 'sales' && companyId && <SalesPicker companyId={companyId} selected={config.sales ?? []} sourceType={config.sourceType ?? 'whatsapp'} onSourceType={(sourceType) => onChange({ sourceType })} onChange={(sales) => onChange({ sales })} />}
 
       {type === 'prompt' && (
         <>
@@ -767,6 +792,7 @@ export function ConfigPanel({ type, config, companyId, catalog, onChange, onDele
 
       {type === 'aw' && (
         <>
+          <AnalysisCalendar config={config} onChange={onChange} />
           <label>
             Dijalankan sebagai
             <div className="segmented">
@@ -1001,31 +1027,44 @@ export function ConfigPanel({ type, config, companyId, catalog, onChange, onDele
 
       {type === 'http' && (
         <>
-          <div className="row">
-            <label style={{ flex: '0 0 92px' }}>
-              Metode
-              <Select value={config.method} onChange={(e) => onChange({ method: e.target.value })}>
-                <option>POST</option>
-                <option>PUT</option>
-                <option>PATCH</option>
-              </Select>
-            </label>
-            <label>
-              URL
-              <input value={config.url ?? ''} placeholder="https://…" onChange={(e) => onChange({ url: e.target.value })} />
-            </label>
-          </div>
-          <label>
-            Header tambahan (satu per baris)
-            <textarea rows={3} value={config.headers ?? ''} placeholder={'X-Secret: nilai\nAuthorization: Bearer …'} onChange={(e) => onChange({ headers: e.target.value })} />
+          <label>Tujuan hasil analisis
+            <Select value={httpDestination(config)} onChange={e=>onChange({destination:e.target.value})}>
+              <option value="autobot">Autobot (bawaan)</option><option value="custom">Endpoint khusus</option>
+            </Select>
           </label>
-          <p className="muted small">Mengirim JSON berisi nama workflow, parameter run, daftar laporan, dan tabel (bila disambung dari Parse Tabel).</p>
+          {httpDestination(config)==='autobot' ? <>
+            <div className="http-autobot-note"><strong>Kirim hasil ke Autobot</strong><p>Tabel dan laporan diterima sebagai memory customer dan tugas follow-up.</p></div>
+            <label>Workflow ID Autobot<input value={config.autobotWorkflowId||''} placeholder="Salin ID dari workflow Autobot" onChange={e=>onChange({autobotWorkflowId:e.target.value.trim()})}/></label>
+            <label>Kunci integrasi Autobot<input type="password" autoComplete="new-password" value={config.autobotApiKey||''} placeholder={config.autobotApiKeyHint?`Tersimpan · berakhir ${config.autobotApiKeyHint}`:'Tempel kunci integrasi workflow'} onChange={e=>onChange({autobotApiKey:e.target.value})}/></label>
+            <p className="muted small">{config.autobotApiKeyHint?'Kosongkan untuk mempertahankan kunci tersimpan.':'Kunci disimpan terenkripsi setelah workflow disimpan.'}</p>
+            <label>Endpoint otomatis<input readOnly value={httpUrl(config)||'https://autobot.dbautoaudit.stream/integration/v1/workflows/…/builder-results'}/></label>
+            <p className="muted small">Metode POST · Autobot menentukan company dan sales berdasarkan konfigurasi workflow.</p>
+          </> : <>
+            <div className="row"><label style={{flex:'0 0 92px'}}>Metode<Select value={config.method||'POST'} onChange={e=>onChange({method:e.target.value})}><option>POST</option><option>PUT</option><option>PATCH</option></Select></label>
+            <label>URL endpoint khusus<input value={config.url||''} placeholder="https://…" onChange={e=>onChange({url:e.target.value})}/></label></div>
+            <label>Header tambahan (satu per baris)<textarea rows={3} value={config.headers||''} placeholder={'X-Secret: nilai\nAuthorization: Bearer …'} onChange={e=>onChange({headers:e.target.value})}/></label>
+          </>}
+          <div className="http-autobot-note"><strong>Contoh tabel yang dikirim</strong><table><thead><tr><th>Customer</th><th>Tindakan</th></tr></thead><tbody><tr><td>Budi Santoso</td><td>Hubungi besok</td></tr></tbody></table><p className="muted small">Sambungkan node Parse Tabel atau laporan ke input HTTP Request.</p></div>
         </>
       )}
 
       {type === 'sheets' && <SheetsConfig config={config} onChange={onChange} />}
 
-      {type === 'trigger' && <p className="small">Rentang tanggal ditanyakan saat tombol Run ditekan, lalu dipakai oleh semua Proses AW.</p>}
+      {type === 'trigger' && <>
+        <label>Mulai workflow melalui<Select value={config.mode ?? 'manual'} onChange={e=>onChange({mode:e.target.value,triggerPeriod:config.triggerPeriod ?? {mode:'yesterday'},triggerSchedule:{frequency:'daily',time:'08:00',start:new Date(Date.now()+7*3600000).toISOString().slice(0,10),...config.triggerSchedule,enabled:e.target.value==='schedule'}})}><option value="manual">Manual (default)</option><option value="schedule">Jadwal otomatis</option><option value="webhook">Webhook</option></Select></label>
+        {(config.mode === 'schedule' || config.mode === 'webhook') && <AnalysisCalendar startMode={config.mode} config={{analysisPeriod:config.triggerPeriod ?? {mode:'yesterday'},analysisSchedule:{...config.triggerSchedule,enabled:config.mode==='schedule'}}} onChange={patch=>onChange({...('analysisPeriod' in patch?{triggerPeriod:patch.analysisPeriod}:{}),...('analysisSchedule' in patch?{triggerSchedule:patch.analysisSchedule}:{})})} />}
+        {config.mode === 'manual' || !config.mode ? <p className="small">Tanggal dipilih saat menekan Run. Jadwal lama pada Proses AW tetap dapat dipakai.</p> : <p className="muted small">Publish untuk mengaktifkan trigger. AW dengan “Ikuti tanggal saat Run” memakai periode Start. Nonaktifkan jadwal otomatis di Proses AW. Pengaturan konfirmasi sebelum jalan tetap berlaku.</p>}
+        {config.mode === 'webhook' && <>
+          <label>URL webhook<input readOnly value={`${window.location.origin}/integration/v1/workflows/${workflowId}/webhook`}/></label>
+          <label>Token webhook<input type="password" autoComplete="new-password" value={config.webhookToken ?? ''} placeholder={config.webhookTokenHint?`Tersimpan · berakhir ${config.webhookTokenHint}`:'Minimal 32 karakter'} onChange={e=>{setNewWebhookToken(e.target.value);setTokenCopied(false);onChange({webhookToken:e.target.value});}}/></label>
+          <button className="btn small" type="button" onClick={()=>{const bytes=crypto.getRandomValues(new Uint8Array(32));const token=Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');setNewWebhookToken(token);setTokenCopied(false);onChange({webhookToken:token});}}>Buat token baru</button>
+          {(config.webhookToken || newWebhookToken) && <button className="btn small" type="button" onClick={async()=>{try{await navigator.clipboard.writeText(config.webhookToken || newWebhookToken);setTokenCopied(true);}catch{setTokenCopied(false);}}}>{tokenCopied?'Token disalin ✓':'Salin token baru'}</button>}
+          {newWebhookToken && <p className="muted small">Token baru dapat disalin selama panel ini terbuka, termasuk setelah tersimpan otomatis.</p>}
+          <p className="muted small">Salin token baru sebelum menutup panel. Token yang sudah tersimpan hanya ditampilkan sebagai petunjuk saat panel dibuka kembali. Kirim POST dengan header Authorization: Bearer TOKEN dan body JSON. Body kosong memakai periode Start.</p>
+          <pre className="small">{JSON.stringify({start_date:'2026-10-05',end_date:'2026-10-05',request_id:'id-unik-dari-sistem-anda'},null,2)}</pre>
+          <p className="muted small">Tanggal dan request_id opsional. Gunakan request_id yang sama saat mengulang permintaan agar tidak membuat run ganda.</p>
+        </>}
+      </>}
       {type === 'viewer' && <p className="small">Laporan tiap Audital Work bisa dibuka dari tampilan run, disalin, atau diunduh sebagai .md / .txt.</p>}
 
       {type !== 'trigger' && (

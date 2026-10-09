@@ -49,9 +49,8 @@ export interface AuditFilter {
   timezone?: string;
 }
 
-export interface RunPayload {
+interface RunPayloadBase {
   company_id: number;
-  sales_id: number;
   model: string;
   prompt?: string;
   saved_prompt_id?: number;
@@ -60,6 +59,11 @@ export interface RunPayload {
   correlation_id?: string;
   filter?: AuditFilter;
 }
+
+export type RunPayload = RunPayloadBase & (
+  | { sales_id: number; whatsapp_official_account_id?: never }
+  | { whatsapp_official_account_id: number; sales_id?: never }
+);
 
 export type RunState = 'running' | 'done' | 'failed' | 'unknown';
 
@@ -182,6 +186,8 @@ export function createClient(opts: ClientOptions) {
 
     // Sales
     listSales: (q: Query) => get('/sales', q),
+    listOfficialAccounts: (companyId: number) => get('/audital-work/whatsapp-official/accounts', { company_id: companyId }),
+    listOfficialMessages: (id: number, body: unknown) => post(`/audital-work/whatsapp-official/accounts/${id}/text-messages`, body),
     getSales: (id: number) => get(`/sales/${id}`),
     listContacts: (id: number, q?: Query) => get(`/sales/${id}/contacts`, q),
     syncSales: (id: number, mode: 'sync' | 'sync-max-priority' | 'sync-no-skip' = 'sync') =>
@@ -204,8 +210,8 @@ export function createClient(opts: ClientOptions) {
     filterPreview: (id: number, filter: AuditFilter) => post(`/audital-work/sales/${id}/filter-preview`, filter),
 
     // Audital Work: run
-    preflight: (payload: RunPayload) => post('/audital-work/runs/preflight', payload),
-    startRun: (payload: RunPayload) => post('/audital-work/runs', payload),
+    preflight: (payload: RunPayload) => post(payload.whatsapp_official_account_id !== undefined ? '/audital-work/whatsapp-official/runs/preflight' : '/audital-work/runs/preflight', payload),
+    startRun: (payload: RunPayload) => post(payload.whatsapp_official_account_id !== undefined ? '/audital-work/whatsapp-official/runs' : '/audital-work/runs', payload),
     getRunStatus: (historyId: number, companyId: number, runBySuperadmin: boolean) =>
       get('/audital-work/runs/status', {
         history_id: historyId,

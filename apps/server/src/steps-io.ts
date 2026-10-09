@@ -1,9 +1,10 @@
+import { dataOutput } from './code.ts';
 // Langkah yang berbicara ke luar: Sync Sales (AutoAudit), Kirim GOWA (GOWA), HTTP Request.
 
 import { readFile } from 'node:fs/promises';
 import { errorCode, unwrap } from '../../../packages/autoaudit/src/index.ts';
 import type { AutoAuditClient } from '../../../packages/autoaudit/src/index.ts';
-import { salesBehind } from '../../../packages/nodes/src/index.ts';
+import { salesBehind, salesSourceKey, httpUrl, httpDestination } from '../../../packages/nodes/src/index.ts';
 import type { Graph, GraphNode } from '../../../packages/nodes/src/index.ts';
 
 export interface GowaConfig {
@@ -30,6 +31,7 @@ export function gowaFromEnv(env: NodeJS.ProcessEnv): GowaConfig | null {
 
 export interface SyncJob {
   sales_id: number;
+  channel?: 'whatsapp' | 'whatsapp_official';
   name: string;
   status: 'pending' | 'queued' | 'done' | 'skipped' | 'failed';
   note?: string;
@@ -52,10 +54,10 @@ export async function advanceSync(
   const c = { ...node.config, ...(run.params?.sync_policy ? { policy: run.params.sync_policy } : {}) };
   let jobs: SyncJob[] = previous?.jobs;
   if (!jobs) {
-    const seen = new Set<number>();
+    const seen = new Set<string>();
     jobs = salesBehind(run.graph, node.id)
-      .filter((s) => !seen.has(s.id) && seen.add(s.id))
-      .map((s) => ({ sales_id: s.id, name: s.name, status: 'pending' as const }));
+      .filter((s) => !seen.has(salesSourceKey(s)) && seen.add(salesSourceKey(s)))
+      .map((s) => ({ sales_id: s.id, channel: s.channel, name: s.name, status: 'pending' as const }));
   }
   let nextCheck: number = previous?.next_check ?? 0;
   const wrap = (status: 'running' | 'done' | 'failed', error?: string) => ({
@@ -66,6 +68,10 @@ export async function advanceSync(
 
   // Mulai sync untuk yang belum dimulai.
   for (const job of jobs.filter((j) => j.status === 'pending')) {
+    if (job.channel === 'whatsapp_official') {
+      Object.assign(job, { status: 'skipped', note: 'WhatsApp Official memakai dataset akun langsung; tidak memerlukan Sync Sales.' });
+      continue;
+    }
     if (c.policy === 'skip') {
       Object.assign(job, { status: 'skipped', note: 'Sync dilewati sesuai pengaturan.' });
       continue;
@@ -232,13 +238,16 @@ export function parseHeaders(text: string): Record<string, string> {
 }
 
 export async function sendHttp(node: GraphNode, payload: unknown, doFetch: typeof fetch = fetch) {
-  const url = String(node.config.url).trim();
-  const method = ['POST', 'PUT', 'PATCH'].includes(node.config.method) ? node.config.method : 'POST';
+  const url = httpUrl(node.config);
+  if(!url) throw new Error('Tujuan HTTP belum lengkap. Isi Workflow ID Autobot atau URL khusus.');
+  const autobot = httpDestination(node.config) === 'autobot';
+  if(autobot && !node.config.autobotApiKey) throw new Error('Kunci integrasi Autobot belum diisi.');
+  const method = autobot ? 'POST' : ['POST', 'PUT', 'PATCH'].includes(node.config.method) ? node.config.method : 'POST';
   let res;
   try {
     res = await doFetch(url, {
       method,
-      headers: { 'Content-Type': 'application/json', ...parseHeaders(node.config.headers) },
+      headers: { 'Content-Type': 'application/json', ...parseHeaders(node.config.headers), ...(autobot?{Authorization:`Bearer ${node.config.autobotApiKey}`}:{}) },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(60_000),
     });
@@ -247,5 +256,7 @@ export async function sendHttp(node: GraphNode, payload: unknown, doFetch: typeo
   }
   const body = await res.text().catch(() => '');
   if (!res.ok) throw new Error(`${new URL(url).host} membalas ${res.status}: ${body.slice(0, 200)}`);
-  return { summary: { kind: 'http', host: new URL(url).host, status: res.status, response: body.slice(0, 300) } };
+  let data: unknown = {response:body.slice(0,2000000),truncated:body.length>2000000};
+  if(body.length<=2000000){try{data=body ? JSON.parse(body) : [];}catch{data={response:body};}}
+  return { ...dataOutput((Array.isArray(data) ? data : [data]).map(value=>({json:value && typeof value==='object' && !Array.isArray(value) ? value : {value}})), 'Respons HTTP'), summary: { kind: 'http', host: new URL(url).host, status: res.status, response: body.slice(0, 300) } };
 }
