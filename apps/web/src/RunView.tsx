@@ -170,7 +170,7 @@ function Report({ item }: { item: Item }) {
             <span>Rentang</span>
             <span>
               {item.filter?.start_date} s/d {item.filter?.end_date}
-              {item.filter?.chat_numbers?.length ? ` · ${item.filter.is_excluded ? 'kecuali' : 'hanya'} ${item.filter.chat_numbers.length} nomor` : ''}
+              {item.filter?.chat_numbers?.length ? ` · ${item.filter.is_excluded ? 'kecuali' : 'hanya'} ${item.filter.chat_numbers.length} chat` : ''}
             </span>
             <span>Estimasi</span>
             <span>

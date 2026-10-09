@@ -68,7 +68,7 @@ export const NODE_HELP = {
       'Atur cepat menyediakan jadwal setiap 2 hari, Senin, tanggal 1, akhir bulan, serta tanggal 1 dan 16. Aktifkan satu jadwal per workflow lalu Publish.',
       'Jam jadwal adalah waktu mulai analisis dalam WIB. Hasil dikirim setelah selesai melalui node pengiriman. Matikan Konfirmasi sebelum jalan di bilah atas bila ingin berjalan tanpa persetujuan tiap run.',
       'Model, jenis chat (private / grup), jendela jam, dan batas waktu per Audital Work.',
-      'Kontak yang dianalisis: semua, hanya nomor tertentu, atau semua kecuali nomor tertentu. Nomor cukup ditempel satu per baris (08…, +62…, atau 62…).',
+      'Kontak / grup yang dianalisis: semua chat, hanya pilihan tertentu, atau kecualikan pilihan tertentu. Tempel nomor (08…, +62…, atau 62…) atau ID grup dari AutoAudit (angka atau …@g.us), satu per baris. Untuk grup, pilih jenis chat Hanya grup atau Private + grup.',
     ],
     tips: [
       'Letak titik di ketupat: kiri = sumber, atas = prompt, bawah = memory, kanan = laporan.',

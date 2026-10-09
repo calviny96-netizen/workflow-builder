@@ -2,7 +2,7 @@ import { GoogleCredentials } from './GoogleCredentials.tsx';
 import { CodeConfig } from './CodeConfig.tsx';
 import { AnalysisCalendar } from './AnalysisCalendar.tsx';
 import { useEffect, useState } from 'react';
-import { DEFAULT_FILE_PATTERN, httpDestination, httpUrl, EXPORT_FORMATS, fileNameFrom, NODE_SPECS, parsePhones, salesSourceKey } from '@nodes';
+import { DEFAULT_FILE_PATTERN, httpDestination, httpUrl, EXPORT_FORMATS, fileNameFrom, NODE_SPECS, parseChatIds, salesSourceKey } from '@nodes';
 import type { NodeType, SalesChannel, SalesSource } from '@nodes';
 import { api } from './api.ts';
 import { NODE_HELP } from './help.ts';
@@ -295,20 +295,20 @@ function SchedulePicker({ companyId, config, onChange }: { companyId: number; co
   );
 }
 
-// Kontak mana yang dianalisis: semua, hanya nomor tertentu, atau semua kecuali nomor tertentu.
+// Pilihan chat mencakup nomor private dan ID grup dari AutoAudit.
 function ContactFilter({ config, onChange }: { config: Record<string, any>; onChange: (patch: Record<string, any>) => void }) {
   const mode: string = config.contactMode ?? 'all';
-  const parsed = parsePhones(config.contactNumbers ?? '');
+  const parsed = parseChatIds(config.contactNumbers ?? '', config.chatType || 'individual');
   const n = parsed.numbers.length;
   return (
     <div className="contact-filter">
-      <div className="choice-title">Kontak yang dianalisis</div>
+      <div className="choice-title">Kontak / grup yang dianalisis</div>
       <div className="segmented">
         {(
           [
-            ['all', 'Semua kontak'],
-            ['only', 'Hanya nomor ini'],
-            ['exclude', 'Kecualikan nomor ini'],
+            ['all', 'Semua chat'],
+            ['only', 'Hanya pilihan ini'],
+            ['exclude', 'Kecualikan pilihan ini'],
           ] as const
         ).map(([value, label]) => (
           <button key={value} className={mode === value ? 'on' : ''} onClick={() => onChange({ contactMode: value })}>
@@ -317,25 +317,26 @@ function ContactFilter({ config, onChange }: { config: Record<string, any>; onCh
         ))}
       </div>
       {mode === 'all' ? (
-        <p className="muted small">Semua kontak pada rentang tanggal ikut dianalisis.</p>
+        <p className="muted small">Semua chat sesuai jenis chat dan rentang tanggal ikut dianalisis.</p>
       ) : (
         <>
           <textarea
             rows={5}
+            aria-label="Nomor WhatsApp atau ID grup"
             value={config.contactNumbers ?? ''}
-            placeholder={'Tempel nomor, satu per baris:\n081234567890\n081298765432'}
+            placeholder={'Tempel nomor atau ID grup, satu per baris:\n081234567890\n120363123456789012@g.us'}
             onChange={(e) => onChange({ contactNumbers: e.target.value })}
           />
           <div className={`contact-result ${mode}`}>
             {n === 0 ? (
-              <span>Belum ada nomor yang dikenali.</span>
+              <span>Belum ada nomor atau ID grup yang dikenali.</span>
             ) : mode === 'only' ? (
               <span>
-                <b>Hanya {n} nomor ini</b> yang dianalisis. Kontak lain diabaikan.
+                <b>Hanya {n} chat ini</b> yang dianalisis. Chat lain diabaikan.
               </span>
             ) : (
               <span>
-                <b>{n} nomor ini dilewati.</b> Semua kontak lain dianalisis.
+                <b>{n} chat ini dilewati.</b> Chat lain sesuai jenis chat dianalisis.
               </span>
             )}
           </div>
@@ -351,12 +352,18 @@ function ContactFilter({ config, onChange }: { config: Record<string, any>; onCh
           )}
           {parsed.invalid.length > 0 && (
             <div className="notice">
-              {parsed.invalid.length} baris bukan nomor dan diabaikan: {parsed.invalid.slice(0, 3).join(', ')}
+              {parsed.invalid.length} input tidak valid. Perbaiki sebelum analisis: {parsed.invalid.slice(0, 3).join(', ')}
               {parsed.invalid.length > 3 ? '…' : ''}
             </div>
           )}
+          {(config.chatType || 'individual') === 'individual' && parsed.groups.length > 0 && (
+            <div className="notice">Daftar berisi ID grup. Pilih jenis chat "Hanya grup" atau "Private + grup".</div>
+          )}
+          {config.chatType === 'group' && parsed.groups.length < n && (
+            <div className="notice">Tempel ID grup dari AutoAudit. Pilih "Private + grup" untuk daftar campuran.</div>
+          )}
           <p className="muted small">
-            Boleh format 08…, +62…, atau 62…, dengan spasi atau tanda hubung; semuanya diubah ke 62…{parsed.duplicates ? ` ${parsed.duplicates} nomor kembar dihitung sekali.` : ''}
+            Nomor private boleh 08…, +62…, atau 62…. Untuk grup, salin ID dari AutoAudit (angka atau …@g.us); ID disimpan sebagai teks. Pisahkan dengan baris baru, koma, atau titik koma.{parsed.duplicates ? ` ${parsed.duplicates} pilihan kembar dihitung sekali.` : ''}
           </p>
         </>
       )}
